@@ -247,6 +247,9 @@ async def message_endpoint(request: Request):
             session = manager.get_or_create_session(conversation_id)
             tree = session["tree"]
 
+            # Check if this is the first message (before we mark it as initialized)
+            is_first_message = "conversation_initialized" not in session
+
             # Create execution node for this request
             node = tree.push(ExecutionNodeType.CLIENT_REQUEST, metadata={"message": user_message})
 
@@ -274,10 +277,13 @@ async def message_endpoint(request: Request):
                     f"📦 [{timestamp_str}] ENCODED+QUEUED: {event_type} (node={node_id}, depth={depth}, encode={encode_time:.1f}ms)"
                 )
 
-            # Load instructions if creating new conversation
+            # Load instructions for first message in conversation
+            # OpenAI Responses API requires instructions when creating a conversation
             instructions = None
-            if conversation_id is None:
+            if is_first_message:
                 instructions = manager.orchestrator.load_default_instructions()
+                session["conversation_initialized"] = True
+                logger.info(f"Loading instructions for new conversation: {conversation_id or 'auto'}")
 
             # Create task for orchestration (so we can cancel it)
             async def run_orchestration():

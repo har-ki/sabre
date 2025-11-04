@@ -134,12 +134,28 @@ class Orchestrator:
         Returns:
             OrchestrationResult with final response
         """
+        # Store instructions if provided (needed for all LLM calls)
+        # OpenAI Responses API requires instructions on every call, so we store them
+        if instructions:
+            self.system_instructions = instructions
+            logger.info(f"Set system instructions ({len(instructions)} chars)")
+
         # Create conversation if needed
-        if conversation_id is None:
+        # IMPORTANT: OpenAI doesn't allow custom conversation IDs - it always generates them
+        # So when instructions are provided, we MUST create a new conversation, even if a conversation_id was given
+        if conversation_id is None or instructions:
             if not instructions:
-                raise ValueError("instructions required when creating new conversation (conversation_id is None)")
-            conversation_id = await self._create_conversation_with_instructions(instructions, model)
-            logger.info(f"✨ Created new conversation ID: {conversation_id}")
+                raise ValueError("instructions required when creating new conversation")
+
+            # Create new conversation with OpenAI-generated ID
+            # (Ignore any provided conversation_id - OpenAI doesn't support custom IDs)
+            openai_conversation_id = await self._create_conversation_with_instructions(instructions, model)
+
+            if conversation_id and conversation_id != openai_conversation_id:
+                logger.info(f"📝 Provided conversation_id '{conversation_id}' ignored - using OpenAI-generated '{openai_conversation_id}'")
+
+            conversation_id = openai_conversation_id
+            logger.info(f"✨ Created conversation ID: {conversation_id}")
             logger.info("📝 Conversation data stored on OpenAI servers (not locally)")
 
         iteration = 0

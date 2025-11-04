@@ -13,30 +13,24 @@ dependencies = [
     "uvicorn[standard]>=0.30.1",
     "starlette>=0.47.2",
     "python-multipart>=0.0.20",
-
     # OpenAI Response Executor (needed by: llm_call, llm_bind, coerce, llm_list_bind helpers)
     "openai>=1.98.0",
     "httpx>=0.28.1",
     "tiktoken>=0.9.0",
-
     # Data handling
     "pydantic>=2.7.4",
     "pyyaml>=6.0.1",
     "orjson>=3.10.4",
     "dill>=0.3.8",
-    "pandas>=2.0.0",  # Needed by: pandas_bind helper
-
+    "pandas>=2.0.0", # Needed by: pandas_bind helper
     # Client UI (pane)
     "prompt-toolkit>=3.0.47",
     "pygments>=2.18.0",
     "jsonpickle>=3.0.0",
-
     # Search
     "ddgs>=9.0.0",
-
     # Visualization
     "matplotlib>=3.7.0",
-
     # HTTP client
     "aiohttp>=3.11.13",
     "aiofiles>=23.2.1",
@@ -45,20 +39,18 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
     "lxml>=5.0.0",
     "PyPDF2>=3.0.0",
-
     # Browser automation (for JavaScript-heavy sites)
     "playwright>=1.40.0",
-
     # Utilities
     "click>=8.1.8",
     "colorama>=0.4.6",
     "python-dateutil>=2.9.0.post0",
     "pytz>=2024.1",
     "certifi>=2024.6.2",
-
     # Common dependencies
     "typing-extensions>=4.12.2",
     "pydantic-core>=2.18.0",
+    "tau2",
 ]
 
 [project.urls]
@@ -76,6 +68,11 @@ test = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=4.1.0",
 ]
+benchmarks = [
+    # Note: tau2-bench should be installed separately as it's optional:
+    # pip install git+https://github.com/sierra-research/tau2-bench
+    # All other benchmark dependencies (fastapi, uvicorn, httpx, click) are already in core dependencies
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -90,6 +87,9 @@ dev-dependencies = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=4.1.0",
 ]
+
+[tool.uv.sources]
+tau2 = { git = "https://github.com/sierra-research/tau2-bench" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

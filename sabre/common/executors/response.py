@@ -309,7 +309,15 @@ class ResponseExecutor:
                 # Success - break out of retry loop
                 break
 
-            except openai.RateLimitError as e:
+            except (openai.RateLimitError, openai.APIStatusError) as e:
+                # Check if this is a rate limit error (handles both RateLimitError and APIStatusError)
+                error_msg = str(e)
+                is_rate_limit = isinstance(e, openai.RateLimitError) or "rate limit" in error_msg.lower()
+
+                if not is_rate_limit:
+                    # Not a rate limit error - re-raise to be caught by APIError handler
+                    raise
+
                 # Extract detailed rate limit headers
                 h = getattr(e, "headers", {}) or {}
                 req_reset = h.get("x-ratelimit-reset-requests")
@@ -317,7 +325,7 @@ class ResponseExecutor:
                 retry_after = h.get("retry-after")
 
                 logger.warning(
-                    f"Rate limit error: "
+                    f"Rate limit error ({type(e).__name__}): "
                     f"x-ratelimit-reset-requests={req_reset}, "
                     f"x-ratelimit-reset-tokens={tok_reset}, "
                     f"retry-after={retry_after}"
@@ -337,7 +345,6 @@ class ResponseExecutor:
                     )
 
                 # Parse retry time from error message or use headers
-                error_msg = str(e)
                 wait_time = None
 
                 # Try retry-after header first
@@ -383,7 +390,7 @@ class ResponseExecutor:
             except openai.APIError as e:
                 # Non-rate-limit API error - return error message instead of raising
                 error_msg = str(e)
-                logger.error(f"API error: {e}")
+                logger.error(f"API error ({type(e).__name__}): {e}")
                 return Assistant(
                     content=[TextContent(f"ERROR: {error_msg}")],
                     response_id=None,

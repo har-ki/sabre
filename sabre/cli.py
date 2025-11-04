@@ -239,13 +239,139 @@ async def run_client():
     return await main()
 
 
+def run_benchmark(args):
+    """Run benchmark evaluation"""
+    from sabre.benchmarks.tau2 import api_bridge, runner as tau2_runner
+    import multiprocessing
+    import httpx
+
+    print("Starting SABRE tau2-bench evaluation...")
+
+    # Check for OpenAI API key (required by API bridge)
+    if not os.getenv("OPENAI_API_KEY"):
+        print("\n✗ OPENAI_API_KEY environment variable not set", file=sys.stderr)
+        print("Set it with: export OPENAI_API_KEY=your_key", file=sys.stderr)
+        return 1
+
+    # Check if SABRE server is running
+    port = os.getenv("PORT", "8011")
+    try:
+        response = httpx.get(f"http://localhost:{port}/health", timeout=2.0)
+        if response.status_code != 200:
+            raise Exception("SABRE server not responding")
+    except:
+        print(f"\n✗ SABRE server not running on port {port}", file=sys.stderr)
+        print(f"Start it with: OPENAI_API_KEY=your_key uv run sabre-server", file=sys.stderr)
+        return 1
+
+    print(f"✓ SABRE server is running on port {port}")
+
+    # Start API bridge in background process using subprocess for better env handling
+    bridge_port = args.bridge_port if hasattr(args, 'bridge_port') else 8765
+    print(f"Starting API bridge on port {bridge_port}...")
+
+    # Use subprocess instead of multiprocessing for better environment variable handling
+    import subprocess as sp
+    bridge_process = sp.Popen(
+        [sys.executable, "-m", "sabre.benchmarks.tau2.api_bridge_main", str(bridge_port), str(port)],
+        env=os.environ.copy(),
+        stdout=sp.PIPE,
+        stderr=sp.STDOUT,
+        text=True
+    )
+    time.sleep(3)  # Wait for bridge to start
+
+    try:
+        # Check bridge health
+        try:
+            response = httpx.get(f"http://localhost:{bridge_port}/health", timeout=2.0)
+            if response.status_code == 200:
+                print(f"✓ API bridge is ready\n")
+        except:
+            print("✗ Failed to start API bridge", file=sys.stderr)
+            bridge_process.terminate()
+            return 1
+
+        # Run evaluation
+        domain = args.domain if hasattr(args, 'domain') else 'retail'
+        trials = 1 if args.quick else (args.trials if hasattr(args, 'trials') else 5)
+        tasks = 5 if args.quick else (args.tasks if hasattr(args, 'tasks') else None)
+
+        task_id_list = None
+        if hasattr(args, 'task_ids') and args.task_ids:
+            task_id_list = [int(tid.strip()) for tid in args.task_ids.split(',')]
+
+        runner = tau2_runner.Tau2Runner(
+            bridge_port=bridge_port,
+            sabre_port=int(port)
+        )
+
+        results = runner.run_evaluation(
+            domain=domain,
+            num_trials=trials,
+            num_tasks=tasks,
+            task_ids=task_id_list
+        )
+
+        print(f"\n✓ Evaluation complete!")
+        print(f"✓ Results saved to: {results}")
+        return 0
+
+    except KeyboardInterrupt:
+        print("\n\nEvaluation interrupted")
+        return 130
+    except Exception as e:
+        print(f"\n✗ Error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        # Clean up bridge process
+        bridge_process.terminate()
+        try:
+            bridge_process.wait(timeout=2)
+        except sp.TimeoutExpired:
+            bridge_process.kill()
+
+
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(description="SABRE CLI")
+
+    # Add subparsers for commands
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+
+    # Benchmark command
+    benchmark_parser = subparsers.add_parser('benchmark', help='Run benchmarks')
+    benchmark_subparsers = benchmark_parser.add_subparsers(dest='benchmark_type', help='Benchmark type')
+
+    # tau2 benchmark
+    tau2_parser = benchmark_subparsers.add_parser('tau2', help='Run tau2-bench evaluation')
+    tau2_parser.add_argument('--domain', choices=['retail', 'airline', 'telecom'],
+                            default='retail', help='Domain to evaluate')
+    tau2_parser.add_argument('--trials', type=int, default=5,
+                            help='Number of trials per task')
+    tau2_parser.add_argument('--tasks', type=int,
+                            help='Number of tasks to run (default: all)')
+    tau2_parser.add_argument('--task-ids',
+                            help='Specific task IDs (comma-separated)')
+    tau2_parser.add_argument('--quick', action='store_true',
+                            help='Quick test (5 tasks, 1 trial)')
+    tau2_parser.add_argument('--bridge-port', type=int, default=8765,
+                            help='API bridge port')
+
+    # Original flags (top level for backwards compatibility)
     parser.add_argument("--stop", action="store_true", help="Stop the running server")
     parser.add_argument("--clean", action="store_true", help="Clean up all SABRE XDG directories")
     parser.add_argument("--force", action="store_true", help="Skip confirmation prompt (for --clean)")
+
     args = parser.parse_args()
+
+    # Handle benchmark command
+    if args.command == 'benchmark':
+        if args.benchmark_type == 'tau2':
+            return run_benchmark(args)
+        else:
+            print("Error: Please specify a benchmark type (e.g., tau2)", file=sys.stderr)
+            return 1
 
     # Handle --clean flag
     if args.clean:
