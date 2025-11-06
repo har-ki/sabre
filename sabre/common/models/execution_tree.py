@@ -36,6 +36,7 @@ class ExecutionStatus(Enum):
     COMPLETED = "completed"  # Finished successfully
     ERROR = "error"  # Failed with error
     CANCELLED = "cancelled"  # User cancelled
+    PAUSED = "paused"  # Paused awaiting external tool results
 
 
 @dataclass

@@ -6,6 +6,7 @@ import pytest
 import websockets
 
 
+@pytest.mark.skip(reason="Outdated test - SABRE uses HTTP SSE not WebSockets")
 @pytest.mark.asyncio
 async def test_websocket_connection():
     """Test basic WebSocket connection and message sending."""

@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from sabre.common.executors.response import ResponseExecutor
 from sabre.server.python_runtime import PythonRuntime
 from sabre.server.streaming_parser import StreamingHelperParser
+from sabre.server.tool_registry import ToolRegistry
 from sabre.common import (
     Event,
     EventType,
@@ -53,13 +54,29 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class OrchestrationResult:
-    """Result of orchestrating a conversation."""
+    """
+    Result of orchestrating a conversation.
+
+    Attributes:
+        success: Whether orchestration completed successfully
+        final_response: Final response text (may be partial if paused)
+        conversation_id: OpenAI conversation ID
+        response_id: OpenAI response ID
+        error: Error message if failed
+        status: Orchestration status ("completed", "awaiting_tool_results", "error")
+        pending_tool_calls: External tools that need execution (None if status="completed")
+        continuation_state: State needed to resume orchestration (for internal use)
+    """
 
     success: bool
     final_response: str
     conversation_id: str
     response_id: str
     error: str | None = None
+
+    # External tool support
+    status: str = "completed"  # "completed", "awaiting_tool_results", "error"
+    pending_tool_calls: list[dict] | None = None  # External tools to execute
 
 
 @dataclass
@@ -85,7 +102,13 @@ class Orchestrator:
     - Continue until completion
     """
 
-    def __init__(self, executor: ResponseExecutor, python_runtime: PythonRuntime, max_iterations: int = 10):
+    def __init__(
+        self,
+        executor: ResponseExecutor,
+        python_runtime: PythonRuntime,
+        max_iterations: int = 10,
+        tool_registry: ToolRegistry | None = None
+    ):
         """
         Initialize orchestrator.
 
@@ -93,10 +116,12 @@ class Orchestrator:
             executor: ResponseExecutor for LLM calls
             python_runtime: Python runtime for executing helpers
             max_iterations: Max continuation iterations (prevent infinite loops)
+            tool_registry: Optional tool registry for external tool support
         """
         self.executor = executor
         self.runtime = python_runtime
         self.max_iterations = max_iterations
+        self.tool_registry = tool_registry or ToolRegistry()  # Default empty registry
         self.system_instructions = None  # Stored after conversation creation
         self._shared_openai_client = None  # Lazy-initialized fallback client
 
@@ -141,12 +166,19 @@ class Orchestrator:
             conversation_id = await self._create_conversation_with_instructions(instructions, model)
             logger.info(f"✨ Created new conversation ID: {conversation_id}")
             logger.info("📝 Conversation data stored on OpenAI servers (not locally)")
+        else:
+            # Update instructions for existing conversation (they must be passed on every call)
+            if instructions:
+                self.system_instructions = instructions
+                logger.debug(f"Updated system_instructions for existing conversation")
 
         iteration = 0
         current_response_id = None
         current_input = input_text
         full_response_text = ""
 
+        logger.warning(f"🎬 ORCHESTRATOR RUN - Starting orchestration for conversation {conversation_id}")
+        logger.warning(f"📨 Input: {current_input[:200]}{'...' if len(current_input) > 200 else ''}")
         logger.info(f"Starting orchestration for conversation {conversation_id}")
 
         while iteration < self.max_iterations:
@@ -193,6 +225,7 @@ class Orchestrator:
             current_response_id = parsed.response_id
             full_response_text = parsed.full_text
 
+            logger.warning(f"🤖 LLM RAW RESPONSE ({len(full_response_text)} chars):\n{full_response_text}")
             logger.debug(f"LLM response ({len(full_response_text)} chars): {full_response_text[:200]}...")
             logger.debug(f"Last 200 chars: ...{full_response_text[-200:]}")
 
@@ -235,10 +268,44 @@ class Orchestrator:
                     response_id=current_response_id,
                 )
 
-            # Execute helpers (may trigger recursive orchestrator calls)
+            # NEW: Partition helpers into internal vs external
+            internal_helpers, external_helpers = self._partition_helpers(parsed.helpers)
+
+            logger.warning(f"🔧 HELPERS DETECTED - {len(internal_helpers)} internal, {len(external_helpers)} external")
+            logger.info(f"Helpers found: {len(internal_helpers)} internal, {len(external_helpers)} external")
+
+            # If there are external helpers, pause and return them to caller
+            if external_helpers:
+                # BUGFIX: Limit external tool calls per turn to prevent LLM hallucination loops
+                MAX_EXTERNAL_TOOLS_PER_TURN = 5
+                if len(external_helpers) > MAX_EXTERNAL_TOOLS_PER_TURN:
+                    logger.warning(f"⚠️  TOO MANY EXTERNAL TOOLS - LLM generated {len(external_helpers)} tool calls, limiting to {MAX_EXTERNAL_TOOLS_PER_TURN}")
+                    external_helpers = external_helpers[:MAX_EXTERNAL_TOOLS_PER_TURN]
+
+                logger.warning(f"⏸️  PAUSING FOR EXTERNAL TOOLS - {len(external_helpers)} external tool(s) detected")
+                for helper in external_helpers:
+                    logger.warning(f"   External tool: {helper[:100]}...")
+                tool_calls = self._parse_external_helpers(external_helpers)
+                logger.warning(f"🔄 RETURNING {len(tool_calls)} TOOL CALLS to caller for execution")
+                for tc in tool_calls:
+                    tc_name = tc.get('name', 'unknown') if isinstance(tc, dict) else getattr(tc, 'name', 'unknown')
+                    logger.warning(f"   Tool call: {tc_name}")
+
+                tree.pop(ExecutionStatus.PAUSED)
+
+                return OrchestrationResult(
+                    success=False,  # Not complete yet
+                    final_response=full_response_text,
+                    conversation_id=conversation_id,
+                    response_id=current_response_id,
+                    status="awaiting_tool_results",
+                    pending_tool_calls=tool_calls,
+                )
+
+            # Execute internal helpers (may trigger recursive orchestrator calls)
             # This saves images to disk for client display
             execution_results = await self._execute_helpers(
-                helpers=parsed.helpers, tree=tree, parent_tree_context=tree_context, event_callback=event_callback
+                helpers=internal_helpers, tree=tree, parent_tree_context=tree_context, event_callback=event_callback
             )
 
             # Upload images to Files API (converts base64 to file_id references)
@@ -1126,3 +1193,194 @@ class Orchestrator:
         text_with_results = re.sub(pattern, replacer, text, flags=re.DOTALL)
         logger.info(f"DEBUG: _replace_helpers_with_results: after replacement={text_with_results[:500]}")
         return text_with_results, all_images
+
+    # ============================================================
+    # EXTERNAL TOOL SUPPORT
+    # ============================================================
+
+    def _partition_helpers(self, helpers: list[str]) -> tuple[list[str], list[str]]:
+        """
+        Separate helpers into internal vs external tool calls.
+
+        Args:
+            helpers: List of helper code blocks
+
+        Returns:
+            Tuple of (internal_helpers, external_helpers)
+        """
+        import ast
+
+        internal = []
+        external = []
+
+        for helper_code in helpers:
+            # Extract function name from the helper code
+            func_name = self._extract_function_name(helper_code)
+
+            if func_name and self.tool_registry.is_external(func_name):
+                external.append(helper_code)
+                logger.debug(f"Classified as external: {func_name}")
+            else:
+                internal.append(helper_code)
+                logger.debug(f"Classified as internal: {func_name}")
+
+        return internal, external
+
+    def _extract_function_name(self, helper_code: str) -> str | None:
+        """
+        Extract function name from helper code.
+
+        Args:
+            helper_code: Python code from <helpers> block
+
+        Returns:
+            Function name or None
+        """
+        import ast
+
+        try:
+            tree = ast.parse(helper_code)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name):
+                        return node.func.id  # Simple function: find_user()
+                    elif isinstance(node.func, ast.Attribute):
+                        # Method call: Search.web_search()
+                        if isinstance(node.func.value, ast.Name):
+                            return f"{node.func.value.id}.{node.func.attr}"
+            return None
+        except SyntaxError:
+            logger.warning(f"Failed to parse helper code: {helper_code[:100]}")
+            return None
+
+    def _parse_external_helpers(self, helpers: list[str]) -> list[dict]:
+        """
+        Convert external helper code to tool_call format.
+
+        Args:
+            helpers: List of external helper code blocks
+
+        Returns:
+            List of tool_calls: [{id, name, arguments}, ...]
+        """
+        import ast
+        import uuid
+
+        tool_calls = []
+
+        for helper_code in helpers:
+            try:
+                tree = ast.parse(helper_code)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Call):
+                        # Get function name
+                        if isinstance(node.func, ast.Name):
+                            func_name = node.func.id
+                        elif isinstance(node.func, ast.Attribute):
+                            if isinstance(node.func.value, ast.Name):
+                                func_name = f"{node.func.value.id}.{node.func.attr}"
+                            else:
+                                continue
+                        else:
+                            continue
+
+                        # Extract arguments
+                        arguments = {}
+
+                        # Positional arguments
+                        for i, arg in enumerate(node.args):
+                            arguments[f"arg{i}"] = self._extract_ast_value(arg)
+
+                        # Keyword arguments
+                        for keyword in node.keywords:
+                            arguments[keyword.arg] = self._extract_ast_value(keyword.value)
+
+                        tool_calls.append({
+                            "id": f"call_{uuid.uuid4().hex[:24]}",
+                            "name": func_name,
+                            "arguments": arguments
+                        })
+
+            except SyntaxError as e:
+                logger.warning(f"Failed to parse external helper: {helper_code[:100]}: {e}")
+                continue
+
+        return tool_calls
+
+    def _extract_ast_value(self, node):
+        """Extract Python value from AST node."""
+        import ast
+
+        if isinstance(node, ast.Constant):
+            return node.value
+        elif isinstance(node, ast.Str):  # Python 3.7 compatibility
+            return node.s
+        elif isinstance(node, ast.Num):
+            return node.n
+        elif isinstance(node, ast.List):
+            return [self._extract_ast_value(elem) for elem in node.elts]
+        elif isinstance(node, ast.Dict):
+            return {
+                self._extract_ast_value(k): self._extract_ast_value(v)
+                for k, v in zip(node.keys, node.values)
+            }
+        elif isinstance(node, ast.Name):
+            return f"${node.id}"  # Variable reference
+        else:
+            return str(node)
+
+    async def continue_with_tool_results(
+        self,
+        conversation_id: str,
+        tool_results: list[dict],
+        tree: ExecutionTree,
+        instructions: str,
+        event_callback: Callable[[Event], Awaitable[None]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 1.0,
+    ) -> OrchestrationResult:
+        """
+        Resume orchestration after external tools have been executed.
+
+        Args:
+            conversation_id: Conversation ID to continue
+            tool_results: Results from external tool execution
+                          Format: [{"name": "tool_name", "result": "..."}]
+            tree: Execution tree
+            instructions: System instructions (REQUIRED - must pass on every call)
+            event_callback: Event callback
+            model: Model to use
+            max_tokens: Max tokens
+            temperature: Temperature
+
+        Returns:
+            OrchestrationResult (may pause again or complete)
+        """
+        logger.warning(f"▶️  RESUMING ORCHESTRATION - Received {len(tool_results)} tool results from external execution")
+        for result in tool_results:
+            logger.warning(f"   Result: {result.get('name', 'unknown')}: {str(result.get('result', ''))[:100]}...")
+        logger.info(f"Resuming orchestration with {len(tool_results)} tool results")
+
+        # Build continuation input with tool results
+        results_text = "\n".join([
+            f"{r['name']}: {r['result']}" for r in tool_results
+        ])
+
+        continuation_input = f"<helpers_result>\n{results_text}\n</helpers_result>"
+
+        logger.warning(f"📝 Continuation input: {continuation_input[:200]}...")
+        logger.debug(f"Continuation input: {continuation_input[:200]}")
+
+        # Resume orchestration by calling run() again
+        # This will make a new LLM call with the results
+        return await self.run(
+            conversation_id=conversation_id,
+            input_text=continuation_input,
+            instructions=instructions,
+            tree=tree,
+            event_callback=event_callback,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )

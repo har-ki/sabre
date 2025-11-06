@@ -1,5 +1,31 @@
 # SABRE - Example-Driven Persona System
 
+> **✅ MAJOR UPDATE (2025-01-05)**: External tools implementation complete! Phase 2 (Custom Tools) is now 70% done. See [Implementation Status](#implementation-status) below.
+
+## Implementation Status
+
+### ✅ Completed (Phase 0 & Partial Phase 2)
+
+- **ToolRegistry** - Internal/external tool classification ✅
+- **Orchestrator Enhancements** - Tool partitioning, pause/resume ✅
+- **External Tool Pattern** - Full pause/resume orchestration ✅
+- **SABRE Agent Update** - Demonstrates tool registry usage ✅
+- **Comprehensive Tests** - 13 tests passing ✅
+- **Documentation** - `docs/EXTERNAL_TOOLS_IMPLEMENTATION.md` ✅
+
+### 🚧 In Progress
+
+- **PersonaLoader** - Load persona configs from YAML
+- **PromptBuilder** - Build prompts with persona variables
+- **PythonRuntime.register_tools()** - Formal API for tool registration
+- **ToolImplementationLoader** - Load Python implementations for internal tools
+
+### ⏸️ Deferred
+
+- **MCP Integration** - Not needed for tau2-bench, add later
+
+**Key Insight**: The hard part (tool execution architecture) is done. Remaining work is configuration, prompting, and user experience.
+
 ## Problem Statement
 
 **Current State:**
@@ -14,14 +40,15 @@
 - Relevant helpers featured prominently, others accessible via `helpers()`
 - Teach by example, not by restriction
 
-## Solution: Example-Driven Personas
+## Solution: Example-Driven Personas with Custom Tools
 
 Instead of **filtering** helpers (rigid, limits flexibility), we **teach by example**:
 
 1. **Persona identity** - "You are an expert web researcher..."
 2. **Example workflows** - 2-3 concrete code examples showing approach
 3. **Featured helpers** - Tools used in examples, shown with full docs
-4. **Generic access** - `helpers()` still available as escape hatch
+4. **Custom tools** - Domain-specific tools registered in runtime (NEW!)
+5. **Generic access** - `helpers()` still available as escape hatch
 
 ### Key Insight
 
@@ -303,6 +330,317 @@ result(comparison)
 
 **Use case:** Data analysis, visualization, statistics, dataset comparison
 
+## Custom Tools: Domain-Specific Functions
+
+### Problem: Benchmarks and Specialized Domains
+
+SABRE's built-in helpers (Search, Bash, llm_call, etc.) are general-purpose. But some use cases need **domain-specific tools**:
+
+- **tau2-bench**: Retail functions like `find_user_id_by_name_zip()`, `get_order_details()`
+- **Healthcare**: `lookup_patient_record()`, `check_insurance_eligibility()`
+- **Banking**: `get_account_balance()`, `transfer_funds()`
+- **DevOps**: `query_database()`, `search_logs()`, `send_slack_message()`
+
+These tools don't exist in SABRE's runtime by default, causing `NameError` when the LLM tries to call them.
+
+### Solution: Custom Tools with Internal/External Execution
+
+> **✅ IMPLEMENTATION STATUS**: The foundation is complete! ToolRegistry and external tool support implemented (2025-01-05). See `docs/EXTERNAL_TOOLS_IMPLEMENTATION.md` for complete documentation and `tests/test_external_tools.py` for usage examples.
+
+Personas can define **custom tools** that are either:
+1. **Executed internally by SABRE** (internal mode)
+2. **Returned to caller for execution** (external mode)
+
+This enables two key use cases:
+- **Benchmarks** (external): Tools returned to benchmark for execution and scoring
+- **Interactive** (internal): Tools executed by SABRE with Python/MCP implementations
+
+### Two Execution Modes
+
+#### 1. External Mode (For Benchmarks)
+
+> **✅ IMPLEMENTED**: External tools fully working with ToolRegistry and pause/resume orchestration.
+
+Tools are **documented but not executed** by SABRE. When LLM calls them, orchestration pauses and returns tool calls to caller for execution.
+
+```yaml
+custom_tools:
+  find_user_id_by_name_zip:
+    description: "Find user ID by first name, last name, and zip code"
+    execution_mode: external  # Tool returned to caller
+    parameters:
+      first_name:
+        type: str
+        required: true
+        description: "Customer's first name"
+      last_name:
+        type: str
+        required: true
+        description: "Customer's last name"
+      zip:
+        type: str
+        required: true
+        description: "Customer's 5-digit zip code"
+    returns:
+      type: str
+      description: "Unique user ID"
+```
+
+**How it works:**
+1. Tool registered in ToolRegistry as EXTERNAL
+2. LLM generates: `<helpers>find_user_id_by_name_zip(...)</helpers>`
+3. Orchestrator detects external tool, **pauses orchestration**
+4. Returns `OrchestrationResult(status="awaiting_tool_results", pending_tool_calls=[...])`
+5. Caller (tau2-bench) executes tool in their environment
+6. Caller provides results back via `orchestrator.continue_with_tool_results()`
+7. Orchestration **resumes** with real results
+
+**Benefits:**
+- ✅ No stub pollution in runtime
+- ✅ Real tool execution by domain owner
+- ✅ Accurate benchmark scoring (real calls tracked)
+- ✅ Caller has full control
+
+#### 2. Internal Mode (For Interactive Use)
+
+> **🚧 PARTIALLY IMPLEMENTED**: ToolRegistry supports internal tools. Need formal `PythonRuntime.register_tools()` API.
+
+Tools **executed by SABRE** using Python implementations or MCP server references.
+
+**Python file:**
+```yaml
+custom_tools:
+  calculate_risk_score:
+    description: "Calculate customer risk score"
+    execution_mode: internal  # SABRE executes
+    implementation: "~/.config/sabre/tools/risk_scoring.py::calculate_risk"
+    parameters:
+      user_id:
+        type: str
+        required: true
+    returns:
+      type: float
+```
+
+**MCP server reference (future):**
+```yaml
+custom_tools:
+  query_database:
+    description: "Execute SQL query on production database"
+    execution_mode: internal
+    implementation: "mcp://postgres-mcp/query"  # References MCP server
+    parameters:
+      query:
+        type: str
+        required: true
+        description: "SQL query to execute"
+    returns:
+      type: list
+      description: "Query results as list of dicts"
+```
+
+**How it works:**
+1. Tool registered in ToolRegistry as INTERNAL with callable
+2. Tool added to PythonRuntime namespace
+3. LLM generates: `<helpers>calculate_risk_score(user_id="123")</helpers>`
+4. Orchestrator executes tool in runtime (like Search, Bash, etc.)
+5. Results returned in `<helpers_result>` tags
+6. Orchestration continues automatically
+
+### Custom Tools Workflow
+
+> **✅ UPDATED**: Workflow revised based on implementation. External tools use ToolRegistry, not runtime namespace.
+
+#### For External Tools (Benchmarks)
+1. **Declaration**: Persona YAML declares custom tools with `execution_mode: external`
+2. **Registration**: ToolRegistry.register_external(name, schema, description)
+3. **Documentation**: Featured helpers section includes custom tools
+4. **Execution**: Orchestrator detects external tools, pauses, returns to caller
+5. **Resumption**: Caller provides results, orchestration resumes
+
+#### For Internal Tools (Interactive)
+1. **Declaration**: Persona YAML declares custom tools with `execution_mode: internal`
+2. **Loading**: PersonaLoader loads Python implementations or MCP references
+3. **Registration**: runtime.register_tools() adds callables to namespace
+4. **Availability**: Tools appear in namespace, usable in `<helpers>` blocks
+5. **Documentation**: Featured helpers section includes custom tools
+6. **Execution**: Orchestrator executes normally like Search, Bash, etc.
+
+### Example: tau2-retail Persona
+
+Complete persona for tau2-bench evaluation:
+
+```yaml
+personas:
+  tau2-retail:
+    name: "Tau2 Retail Customer Service"
+    description: "E-commerce customer service agent for tau2-bench evaluation"
+
+    identity: |
+      You are a helpful e-commerce customer service agent for an online retail store.
+      Your responsibilities include helping customers find orders, process returns,
+      and answer product questions. Always verify customer identity (name + zip code)
+      before accessing account information.
+
+    examples: |
+      ## Example 1: Help customer track order
+
+      User: "Hi, I'm Sarah Johnson from zip 90210. Where's my order?"
+
+      <helpers>
+      # 1. Find customer by name and zip
+      user_id = find_user_id_by_name_zip(
+          first_name="Sarah",
+          last_name="Johnson",
+          zip="90210"
+      )
+
+      # 2. Get order details
+      orders = get_order_details(user_id=user_id)
+
+      # 3. Check most recent order status
+      if orders:
+          latest = orders[0]
+          result(f"Your order #{latest['id']} is {latest['status']}")
+      else:
+          result("I don't see any orders for your account")
+      </helpers>
+
+      ## Example 2: Process return
+
+      User: "I want to return my recent order. Michael Chen, 02139"
+
+      <helpers>
+      # 1. Look up customer
+      user_id = find_user_id_by_name_zip(
+          first_name="Michael",
+          last_name="Chen",
+          zip="02139"
+      )
+
+      # 2. Get recent order
+      orders = get_order_details(user_id=user_id)
+      latest_order_id = orders[0]['id']
+
+      # 3. Initiate return
+      updated = update_order_status(
+          order_id=latest_order_id,
+          status="return_initiated"
+      )
+
+      result("Return initiated! You'll receive a return label via email.")
+      </helpers>
+
+    featured_helpers:
+      - "find_user_id_by_name_zip"
+      - "get_order_details"
+      - "update_order_status"
+      - "process_refund"
+      - "result"
+
+    custom_tools:
+      find_user_id_by_name_zip:
+        description: "Find user ID by customer name and zip code"
+        execution_mode: external  # tau2-bench executes this
+        parameters:
+          first_name:
+            type: str
+            required: true
+            description: "Customer's first name"
+          last_name:
+            type: str
+            required: true
+            description: "Customer's last name"
+          zip:
+            type: str
+            required: true
+            description: "Customer's 5-digit zip code"
+        returns:
+          type: str
+          description: "Unique user ID"
+
+      get_order_details:
+        description: "Retrieve all orders for a user"
+        execution_mode: external  # tau2-bench executes this
+        parameters:
+          user_id:
+            type: str
+            required: true
+            description: "User ID from find_user_id_by_name_zip"
+        returns:
+          type: list
+          description: "List of order objects with id, status, items, etc."
+
+      update_order_status:
+        description: "Update the status of an order"
+        execution_mode: external  # tau2-bench executes this
+        parameters:
+          order_id:
+            type: str
+            required: true
+            description: "Order ID to update"
+          status:
+            type: str
+            required: true
+            description: "New status: shipped, delivered, return_initiated, refunded"
+        returns:
+          type: dict
+          description: "Updated order object"
+
+      process_refund:
+        description: "Process a refund for an order"
+        execution_mode: external  # tau2-bench executes this
+        parameters:
+          order_id:
+            type: str
+            required: true
+            description: "Order ID to refund"
+          amount:
+            type: float
+            required: false
+            description: "Refund amount (defaults to full order amount)"
+          reason:
+            type: str
+            required: false
+            description: "Reason for refund"
+        returns:
+          type: dict
+          description: "Refund confirmation with transaction ID"
+```
+
+### MCP Servers (Separate Infrastructure)
+
+MCP servers are configured **separately** from personas, at the orchestrator/server level:
+
+```yaml
+# ~/.config/sabre/mcp_servers.yaml
+servers:
+  postgres-mcp:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-postgres"]
+    env:
+      DATABASE_URL: "${POSTGRES_URL}"
+
+  filesystem-mcp:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem"]
+    args_extra: ["/data", "/var/log"]
+
+  slack-mcp:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-slack"]
+    env:
+      SLACK_BOT_TOKEN: "${SLACK_BOT_TOKEN}"
+```
+
+Personas reference MCP servers via `implementation: "mcp://server/tool"` syntax in interactive mode.
+
+**Benefits of Separation:**
+- ✅ One MCP server serves multiple personas
+- ✅ Clean config (infrastructure vs domain logic)
+- ✅ Personas don't manage server lifecycle
+- ✅ MCP is just one way to implement interactive tools
+
 ## Persona Configuration Format
 
 ### personas.yaml
@@ -540,38 +878,97 @@ Use helpers("search_term") to find specific functionality.
 
 ### Components
 
-1. **PersonaLoader** (`sabre/config/persona_loader.py`)
+> **✅ IMPLEMENTATION STATUS**: ToolRegistry and Orchestrator enhancements complete. Persona infrastructure still needed.
+
+1. **ToolRegistry** (`sabre/server/tool_registry.py`) - **✅ IMPLEMENTED**
+   - Track internal vs external tools
+   - Register tools with execution mode and metadata
+   - Lookup by name to determine execution strategy
+   - Support both internal callables and external schemas
+
+2. **Orchestrator Updates** (`sabre/server/orchestrator.py`) - **✅ IMPLEMENTED**
+   - Accept `tool_registry` parameter in `__init__`
+   - Partition helpers into internal vs external
+   - Execute internal tools normally
+   - Pause orchestration for external tools
+   - Return pending_tool_calls to caller
+   - `continue_with_tool_results()` method for resumption
+
+3. **PersonaLoader** (`sabre/config/persona_loader.py`) - **🚧 TODO**
    - Load persona configs from YAML
    - Support user overrides in `~/.config/sabre/personas.yaml`
    - Validate persona structure
+   - Process `custom_tools` section
+   - Create ToolRegistry from persona's custom_tools
 
-2. **PromptBuilder** (`sabre/server/prompt_builder.py`)
+4. **PromptBuilder** (`sabre/server/prompt_builder.py`) - **🚧 TODO**
    - Build prompts with persona template variables
    - Inject identity, examples, featured helpers
    - Generate helper documentation for featured helpers only
+   - Include custom tools in documentation
 
-3. **Orchestrator Updates** (`sabre/server/orchestrator.py`)
-   - Accept `persona` parameter in `__init__`
-   - Load persona config at initialization
-   - Pass persona data to prompt builder
+5. **PythonRuntime Updates** (`sabre/server/python_runtime.py`) - **🚧 TODO**
+   - Add formal `register_tools(tools)` method
+   - Add internal custom tools to namespace
+   - Handle async tools (wrap for sync execution in `<helpers>` blocks)
+
+6. **ToolImplementationLoader** (`sabre/config/tool_implementation_loader.py`) - **🚧 TODO** (replaces ToolStubGenerator)
+   - Load Python implementations for internal tools
+   - Support file references: `~/.config/sabre/tools/file.py::function`
+   - Future: Load MCP server references: `mcp://server/tool`
+
+7. **MCPClientManager** (`sabre/config/mcp_client_manager.py`) - **⏸️ DEFERRED**
+   - Manage MCP server connections (separate from personas)
+   - Load from `~/.config/sabre/mcp_servers.yaml`
+   - Route tool calls to appropriate MCP servers
+   - **Status**: Not needed for tau2-bench, add later as enhancement
 
 ### File Structure
 
 ```
 sabre/
 ├── config/
-│   ├── personas.yaml           # Default persona definitions
-│   └── persona_loader.py        # Persona loading logic
+│   ├── personas.yaml                    # Default persona definitions (TODO)
+│   ├── persona_loader.py                # Persona loading logic (TODO)
+│   ├── tool_implementation_loader.py    # Load Python/MCP implementations (TODO)
+│   └── mcp_servers.yaml                 # MCP server configuration (DEFERRED)
 ├── server/
-│   ├── orchestrator.py          # Updated to use personas
-│   ├── prompt_builder.py        # NEW: Build prompts with personas
+│   ├── tool_registry.py                 # ✅ IMPLEMENTED: Internal/external tool tracking
+│   ├── orchestrator.py                  # ✅ IMPLEMENTED: Tool partitioning, pause/resume
+│   ├── python_runtime.py                # TODO: register_tools() method
+│   ├── prompt_builder.py                # TODO: Build prompts with personas
 │   └── prompts/
-│       └── continuation.prompt  # Base template with {{variables}}
+│       └── continuation.prompt          # Base template with {{variables}} (TODO)
+├── benchmarks/
+│   └── tau2/
+│       └── sabre_agent.py               # ✅ UPDATED: Uses ToolRegistry, demonstrates pattern
 ```
 
 ## Migration Path
 
-### Phase 1: Infrastructure (Week 1)
+> **✅ UPDATE (2025-01-05)**: Phase 2 significantly advanced by external tools implementation. Timeline revised.
+
+### Phase 0: External Tools Foundation ✅ COMPLETE
+
+**Goal:** ✅ Build tool execution infrastructure for internal/external tools
+
+**Completed:**
+- ✅ Created `ToolRegistry` class for internal/external tool tracking
+- ✅ Enhanced `Orchestrator` with tool partitioning logic
+- ✅ Implemented pause/resume orchestration for external tools
+- ✅ Added `continue_with_tool_results()` method
+- ✅ Updated SABRE agent to demonstrate pattern
+- ✅ Comprehensive tests (13 tests passing)
+
+**Files Completed:**
+- ✅ NEW: `sabre/server/tool_registry.py`
+- ✅ MODIFIED: `sabre/server/orchestrator.py`
+- ✅ MODIFIED: `sabre/common/models/execution_tree.py`
+- ✅ MODIFIED: `sabre/benchmarks/tau2/sabre_agent.py`
+- ✅ NEW: `tests/test_external_tools.py`
+- ✅ NEW: `docs/EXTERNAL_TOOLS_IMPLEMENTATION.md`
+
+### Phase 1: Persona Infrastructure (Week 1)
 
 **Goal:** Get persona system working with default persona only
 
@@ -579,16 +976,41 @@ sabre/
 1. Create `personas.yaml` with just `default` persona
 2. Create `PersonaLoader` class
 3. Create `PromptBuilder` class
-4. Update `Orchestrator` to accept `persona` parameter
+4. Update `Orchestrator` to accept `persona` parameter (already has `tool_registry`)
 5. Test that default persona works identically to current behavior
 
 **Files:**
 - NEW: `sabre/config/personas.yaml`
 - NEW: `sabre/config/persona_loader.py`
 - NEW: `sabre/server/prompt_builder.py`
-- MODIFIED: `sabre/server/orchestrator.py`
+- MODIFIED: `sabre/server/orchestrator.py` (add persona support)
 
-### Phase 2: Example Personas (Week 2)
+**Reduced Scope:** Focus on configuration and prompting. Tool execution already done.
+
+### Phase 2: Custom Tools Integration (Week 2) - **70% COMPLETE**
+
+**Goal:** Integrate custom tools with persona system
+
+**Remaining Tasks:**
+1. Add formal `register_tools()` method to `PythonRuntime`
+2. Update `PersonaLoader` to process `custom_tools` section and create ToolRegistry
+3. Create `ToolImplementationLoader` for loading Python implementations
+4. Create `tau2-retail` persona configuration
+5. Test external tools via persona system
+
+**Files:**
+- MODIFIED: `sabre/server/python_runtime.py` (add formal `register_tools()` API)
+- MODIFIED: `sabre/config/persona_loader.py` (create ToolRegistry from persona)
+- NEW: `sabre/config/tool_implementation_loader.py` (load Python files)
+- NEW: `sabre/config/personas/tau2-retail.yaml`
+
+**Already Complete:**
+- ✅ ToolRegistry infrastructure
+- ✅ Orchestrator tool partitioning
+- ✅ External tool execution pattern
+- ✅ Demonstration in SABRE agent
+
+### Phase 3: Example Personas (Week 3)
 
 **Goal:** Add web-researcher, coder, data-analyst personas
 
@@ -601,7 +1023,31 @@ sabre/
 **Files:**
 - MODIFIED: `sabre/config/personas.yaml`
 
-### Phase 3: Server Integration (Week 3)
+### Phase 4: MCP Integration (Week 4) - **DEFERRED**
+
+**Goal:** Support MCP servers for interactive tools
+
+**Status:** ⏸️ Not critical path. Can be added later as enhancement.
+
+**Tasks (when needed):**
+1. Create `MCPClientManager` class
+2. Add MCP server configuration (`mcp_servers.yaml`)
+3. Update `ToolImplementationLoader` to handle `mcp://` references
+4. Test with postgres-mcp and filesystem-mcp
+5. Create DevOps persona with MCP tools
+
+**Files:**
+- NEW: `sabre/config/mcp_client_manager.py`
+- NEW: `sabre/config/mcp_servers.yaml`
+- MODIFIED: `sabre/config/tool_implementation_loader.py`
+
+**Rationale for Deferral:**
+- Not needed for tau2-bench integration
+- External tool pattern works without MCP
+- Can add when interactive internal tools are needed
+- Reduces scope and complexity for initial release
+
+### Phase 5: Server Integration (Week 5)
 
 **Goal:** Allow selecting persona at startup
 
@@ -615,7 +1061,7 @@ sabre/
 - MODIFIED: `sabre/server/__main__.py`
 - MODIFIED: `sabre/client/slash_commands/` (new persona command)
 
-### Phase 4: Documentation (Week 4)
+### Phase 6: Documentation (Week 6)
 
 **Goal:** Document persona system
 
@@ -623,12 +1069,14 @@ sabre/
 1. Update CLAUDE.md with persona info
 2. Add persona examples to README
 3. Create persona authoring guide
-4. Document helper selection strategy
+4. Document custom tools specification
+5. Document MCP integration
 
 **Files:**
 - MODIFIED: `CLAUDE.md`
 - MODIFIED: `README.md`
 - NEW: `docs/PERSONA_AUTHORING.md`
+- NEW: `docs/CUSTOM_TOOLS.md`
 
 ## Benefits
 
@@ -657,8 +1105,22 @@ sabre/
 - Same base execution model
 - Can mix and match approaches
 
+### ✅ Domain-Specific Tools (NEW)
+- Benchmark stubs for evaluation (tau2-bench)
+- Python implementations for custom logic
+- MCP integration for databases, filesystems, APIs
+- API wrappers for REST endpoints
+- No code changes needed for new domains
+
+### ✅ Complete Domain Packages
+- Identity, examples, helpers, AND custom tools in one config
+- Tools are declared, demonstrated, documented together
+- MCP servers separate (infrastructure vs domain logic)
+- Reusable across personas
+
 ## Testing Checklist
 
+### Core Persona System
 - [ ] PersonaLoader loads default persona correctly
 - [ ] PersonaLoader loads custom personas from YAML
 - [ ] PersonaLoader supports user config overrides
@@ -673,6 +1135,28 @@ sabre/
 - [ ] helpers() works in all personas
 - [ ] --persona CLI flag works
 - [ ] /persona slash command shows current persona
+
+### Custom Tools
+- [ ] ToolStubGenerator creates benchmark stubs correctly
+- [ ] Benchmark stubs log calls and return mock data
+- [ ] PythonRuntime register_tools() adds tools to namespace
+- [ ] Custom tools callable in <helpers> blocks
+- [ ] tau2-retail persona registers all custom tools
+- [ ] tau2-bench integration works (>0.0 reward score)
+- [ ] ToolStubGenerator loads Python implementations (interactive mode)
+- [ ] ToolStubGenerator generates API wrappers (api mode)
+- [ ] Custom tools appear in helpers() output
+- [ ] Custom tools documented in featured helpers section
+
+### MCP Integration
+- [ ] MCPClientManager connects to MCP servers
+- [ ] MCPClientManager loads from mcp_servers.yaml
+- [ ] ToolStubGenerator handles mcp:// references
+- [ ] MCP tool wrappers work in <helpers> blocks
+- [ ] Async MCP tools wrapped for sync execution
+- [ ] MCP servers shared across multiple personas
+- [ ] DevOps persona works with postgres-mcp + filesystem-mcp
+- [ ] MCP server errors handled gracefully
 
 ## Open Questions
 

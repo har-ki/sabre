@@ -8,8 +8,10 @@ import asyncio
 import httpx
 import json
 import time
+import pytest
 
 
+@pytest.mark.skip(reason="Outdated test - /test-sse endpoint no longer exists")
 async def test_sse_client():
     """Connect to SSE test server and print events."""
     url = "http://localhost:8012/test-sse"
