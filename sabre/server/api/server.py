@@ -611,6 +611,10 @@ async def create_connector(request: ConnectorCreateRequest):
         # Connect to server
         connector_id = await manager.mcp_manager.connect(config)
 
+        # Refresh MCP adapter's tool cache BEFORE updating runtime
+        # This ensures the adapter discovers tools from the newly connected server
+        await manager.mcp_adapter.refresh_tools()
+
         # Refresh runtime tools
         if manager.orchestrator and manager.orchestrator.runtime:
             manager.orchestrator.runtime.mcp_adapter = manager.mcp_adapter
@@ -731,6 +735,9 @@ async def update_connector(connector_id: str, request: ConnectorUpdateRequest):
         # Update connector
         await manager.mcp_manager.update_connector(connector_id, updates)
 
+        # Refresh MCP adapter's tool cache after update
+        await manager.mcp_adapter.refresh_tools()
+
         # Refresh runtime tools
         if manager.orchestrator and manager.orchestrator.runtime:
             manager.orchestrator.runtime.mcp_adapter = manager.mcp_adapter
@@ -772,6 +779,9 @@ async def patch_connector(connector_id: str, request: ConnectorUpdateRequest):
             else:
                 await manager.mcp_manager.disable_connector(connector_id)
 
+            # Refresh MCP adapter's tool cache after enable/disable
+            await manager.mcp_adapter.refresh_tools()
+
             # Refresh runtime tools
             if manager.orchestrator and manager.orchestrator.runtime:
                 manager.orchestrator.runtime.mcp_adapter = manager.mcp_adapter
@@ -779,6 +789,14 @@ async def patch_connector(connector_id: str, request: ConnectorUpdateRequest):
         else:
             # Fall back to full update
             await manager.mcp_manager.update_connector(connector_id, updates)
+
+            # Refresh MCP adapter's tool cache after update
+            await manager.mcp_adapter.refresh_tools()
+
+            # Refresh runtime tools
+            if manager.orchestrator and manager.orchestrator.runtime:
+                manager.orchestrator.runtime.mcp_adapter = manager.mcp_adapter
+                manager.orchestrator.runtime.reset()
 
         # Get updated info
         info = manager.mcp_manager.get_connector_info(connector_id)
@@ -808,6 +826,9 @@ async def delete_connector(connector_id: str):
 
         # Disconnect and delete
         await manager.mcp_manager.disconnect(connector_id)
+
+        # Refresh MCP adapter's tool cache after disconnection
+        await manager.mcp_adapter.refresh_tools()
 
         # Refresh runtime tools
         if manager.orchestrator and manager.orchestrator.runtime:

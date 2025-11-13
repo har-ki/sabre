@@ -388,7 +388,45 @@ class ResponseExecutor:
                 )
 
             except Exception as e:
-                # Unexpected error - return error message instead of raising
+                # Check if it's a retryable network error
+                import httpx
+                error_str = str(e).lower()
+                is_network_error = (
+                    isinstance(e, (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError))
+                    or "peer closed connection" in error_str
+                    or "incomplete chunked read" in error_str
+                    or "connection reset" in error_str
+                    or "connection closed" in error_str
+                )
+
+                if is_network_error and attempt < max_retries - 1:
+                    # Retry on network errors with exponential backoff
+                    wait_time = (2 ** attempt) * 2  # 2, 4, 8 seconds
+                    logger.warning(
+                        f"Network error (attempt {attempt + 1}/{max_retries}): {e}. "
+                        f"Retrying in {wait_time}s..."
+                    )
+
+                    # Send retry event
+                    if event_callback and tree_context:
+                        await event_callback(
+                            ResponseRetryEvent(
+                                node_id=tree_context["node_id"],
+                                parent_id=tree_context.get("parent_id"),
+                                depth=tree_context["depth"],
+                                path=tree_context["path"],
+                                conversation_id=tree_context.get("conversation_id", conversation_id),
+                                attempt=attempt + 1,
+                                max_retries=max_retries,
+                                wait_seconds=wait_time,
+                                reason=f"Network error: {str(e)}",
+                            )
+                        )
+
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                # Non-retryable error or max retries reached - return error message
                 logger.error(f"Unexpected error during streaming: {e}", exc_info=True)
                 return Assistant(
                     content=[TextContent(f"ERROR: Unexpected error: {str(e)}")],

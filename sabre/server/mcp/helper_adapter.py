@@ -103,8 +103,8 @@ class MCPHelperAdapter:
             """
             Wrapper function that invokes the MCP tool.
 
-            This runs the async tool call synchronously using a robust event loop pattern,
-            since it's called from Python runtime's exec() context.
+            Routes all tool calls to the MCP client's owning event loop to prevent
+            "Task got Future attached to a different loop" errors.
 
             Accepts both positional and keyword arguments to be flexible with LLM calls.
             """
@@ -122,38 +122,129 @@ class MCPHelperAdapter:
                                 if param_name not in kwargs:  # Don't override explicit kwargs
                                     kwargs[param_name] = arg
 
-                # Run async invocation synchronously with robust event loop handling
+                # Extract server name to get the client's owning loop
+                server_name = qualified_name.split(".", 1)[0]
+                client = self.client_manager.get_client_by_name(server_name)
+                if client is None:
+                    raise ValueError(f"MCP server '{server_name}' not found or not connected")
+                target_loop = getattr(client, "loop", None)
 
-                # If we have a reference to the main loop (from server), use it for thread-safe execution
-                if self._main_loop is not None:
-                    # We're in a worker thread - submit coroutine to main loop
-                    future = asyncio.run_coroutine_threadsafe(
-                        self.invoke_tool(qualified_name, **kwargs),
-                        self._main_loop
-                    )
-                    return future.result()
-
-                # Check if we're in a running event loop
-                try:
-                    loop = asyncio.get_running_loop()
-                    # We're in a running loop - need to execute in a new thread
-                    import concurrent.futures
-
-                    def run_async_in_thread():
-                        # Create new event loop for this thread
-                        new_loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(new_loop)
-                        try:
-                            return new_loop.run_until_complete(self.invoke_tool(qualified_name, **kwargs))
-                        finally:
-                            new_loop.close()
-
-                    with concurrent.futures.ThreadPoolExecutor() as pool:
-                        future = pool.submit(run_async_in_thread)
-                        return future.result()
-                except RuntimeError:
-                    # No running loop - can use asyncio.run() directly
+                if target_loop is None:
+                    # No loop stored - fall back to asyncio.run (should not happen in production)
+                    logger.warning(f"No loop stored for client {server_name}, using asyncio.run()")
                     return asyncio.run(self.invoke_tool(qualified_name, **kwargs))
+
+                logger.debug(f"[{qualified_name}] Routing to client loop: {hex(id(target_loop))}")
+
+                # Build coroutine
+                coro = self.invoke_tool(qualified_name, **kwargs)
+
+                # Try to detect current running loop
+                try:
+                    running_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    running_loop = None
+
+                import concurrent.futures
+
+                # Helper function: schedule coro on target_loop and wait for result
+                def rendezvous():
+                    fut = asyncio.run_coroutine_threadsafe(coro, target_loop)
+                    content_list = fut.result()  # This is list[Content]
+                    logger.debug(f"[{qualified_name}] Got {len(content_list)} content items")
+
+                    # DEBUG: Log what we actually got
+                    for i, item in enumerate(content_list):
+                        logger.debug(f"[{qualified_name}] Content {i}: type={type(item).__name__}, has_text={hasattr(item, 'text')}")
+                        if hasattr(item, 'text') and item.text:
+                            preview = item.text[:100] if len(item.text) > 100 else item.text
+                            logger.debug(f"[{qualified_name}] Content {i} text preview: {preview}")
+
+                    # Extract text from Content objects
+                    # MCP tools typically return JSON in text format
+                    result_value = None
+                    if len(content_list) == 0:
+                        result_value = None
+                    elif len(content_list) == 1:
+                        # Single content item - return the text directly
+                        content_item = content_list[0]
+                        if hasattr(content_item, 'text'):
+                            text = content_item.text
+                            if text:
+                                # Strip whitespace
+                                text = text.strip()
+                                # Always try to parse as JSON first (handles strings, objects, arrays, etc.)
+                                try:
+                                    import json
+                                    result_value = json.loads(text)
+                                    logger.debug(f"[{qualified_name}] Parsed as JSON: {type(result_value).__name__}")
+                                except json.JSONDecodeError:
+                                    # Not valid JSON, use as-is
+                                    logger.debug(f"[{qualified_name}] Not JSON, using text as-is")
+                                    result_value = text
+                            else:
+                                result_value = text
+                        else:
+                            result_value = str(content_item)
+                    else:
+                        # Multiple content items - return list of texts
+                        texts = []
+                        for content_item in content_list:
+                            if hasattr(content_item, 'text'):
+                                text = content_item.text
+                                if text:
+                                    text = text.strip()
+                                    # Try to parse each item as JSON
+                                    try:
+                                        import json
+                                        texts.append(json.loads(text))
+                                    except json.JSONDecodeError:
+                                        # Not JSON, use text as-is
+                                        texts.append(text)
+                                else:
+                                    texts.append(text)
+                            else:
+                                texts.append(str(content_item))
+                        result_value = texts
+
+                    # Log the final result type
+                    logger.debug(f"[{qualified_name}] Final result type: {type(result_value).__name__}")
+
+                    # Print the result so it's captured by the orchestrator
+                    # This makes the tool output visible in <helpers_result>
+                    if result_value is not None:
+                        import json as json_mod
+                        if isinstance(result_value, (dict, list)):
+                            # Pretty print JSON for readability
+                            print(json_mod.dumps(result_value, indent=2))
+                        else:
+                            print(result_value)
+
+                    return result_value
+
+                # Case 1: No running loop - we can safely call rendezvous directly
+                if running_loop is None:
+                    logger.debug(f"[{qualified_name}] No running loop, calling rendezvous directly")
+                    return rendezvous()
+
+                # Case 2: Running on same loop as target - offload to thread to avoid deadlock
+                # (calling .result() blocks, which would prevent the loop from processing the task)
+                if running_loop is target_loop:
+                    logger.debug(
+                        f"[{qualified_name}] Same loop detected ({hex(id(running_loop))}), "
+                        "offloading to thread to prevent deadlock"
+                    )
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        return pool.submit(rendezvous).result()
+
+                # Case 3: Running on different loop - can call rendezvous directly
+                # (the .result() blocks on THIS loop, while target_loop processes the task)
+                logger.debug(
+                    f"[{qualified_name}] Different loops: running={hex(id(running_loop))}, "
+                    f"target={hex(id(target_loop))}, calling rendezvous"
+                )
+                return rendezvous()
+
             except Exception as e:
                 logger.error(f"Error invoking MCP tool {qualified_name}: {e}")
                 raise
@@ -167,6 +258,8 @@ class MCPHelperAdapter:
     async def invoke_tool(self, qualified_name: str, **kwargs) -> list[Content]:
         """
         Invoke an MCP tool and return SABRE Content.
+
+        This method is loop-aware: it ensures client.call_tool() runs on the client's owning loop.
 
         Args:
             qualified_name: Qualified tool name (ServerName.tool_name)
@@ -186,20 +279,38 @@ class MCPHelperAdapter:
         server_name, tool_name = qualified_name.split(".", 1)
 
         # Get client for server
-        if not self.client_manager.has_server(server_name):
+        client = self.client_manager.get_client_by_name(server_name)
+        if client is None:
             raise MCPServerNotFoundError(server_name)
+        target_loop = getattr(client, "_loop", None)
 
-        client = self.client_manager.get_client(server_name)
+        # Detect current loop
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
 
-        # Call tool via MCP client
-        logger.debug(f"Invoking MCP tool: {qualified_name} with args: {kwargs}")
-        mcp_result = await client.call_tool(tool_name, kwargs)
+        # If we're already on the client's loop (or no loop stored), just call directly
+        if target_loop is None or current_loop is target_loop:
+            logger.debug(f"Invoking MCP tool: {qualified_name} with args: {kwargs}")
+            mcp_result = await client.call_tool(tool_name, kwargs)
+            sabre_content = self._transform_result(mcp_result)
+            logger.debug(f"MCP tool {qualified_name} returned {len(sabre_content)} content items")
+            return sabre_content
 
-        # Transform MCP result to SABRE Content
-        sabre_content = self._transform_result(mcp_result)
+        # We're on a different loop - route to the client's loop
+        # This should not normally happen since invoke_tool is async and should be called
+        # from the same context as the client, but we handle it for safety
+        logger.debug(f"Routing MCP tool {qualified_name} to client's loop (current != target)")
 
-        logger.debug(f"MCP tool {qualified_name} returned {len(sabre_content)} content items")
-        return sabre_content
+        import concurrent.futures
+
+        async def do_call():
+            mcp_result = await client.call_tool(tool_name, kwargs)
+            return self._transform_result(mcp_result)
+
+        future = asyncio.run_coroutine_threadsafe(do_call(), target_loop)
+        return future.result()
 
     def _transform_result(self, mcp_result: MCPToolResult) -> list[Content]:
         """

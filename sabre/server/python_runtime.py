@@ -4,6 +4,7 @@ Python Runtime for executing <helpers> blocks.
 Provides isolated execution environment with helper functions.
 """
 
+import asyncio
 import sys
 import io
 import os
@@ -140,10 +141,12 @@ class PythonRuntime:
             "pd": pd,  # pandas for user code
         }
 
-        # Add datetime module
+        # Add standard library modules
         import datetime
+        import json
 
         self.namespace["datetime"] = datetime
+        self.namespace["json"] = json
 
         # Storage for captured figures
         self._captured_figures: list[ImageContent] = []
@@ -163,13 +166,32 @@ class PythonRuntime:
 
             # Group tools by server to create namespace objects
             # e.g., remote_test.echo becomes remote_test object with echo attribute
+            # Note: tools from get_available_tools() are already wrapped as synchronous callables
             servers = {}
             for tool_name, tool_func in mcp_tools.items():
                 if "." in tool_name:
                     server_name, method_name = tool_name.split(".", 1)
                     if server_name not in servers:
                         servers[server_name] = type(server_name, (), {})()
-                    setattr(servers[server_name], method_name, tool_func)
+
+                    # Handle nested namespaces (e.g., tau2_retail_task_0.tau2.get_result)
+                    # We need to create nested objects for each dot-separated component
+                    if "." in method_name:
+                        # Split method_name into parts: ["tau2", "get_result"]
+                        parts = method_name.split(".")
+                        # Navigate/create nested objects
+                        current_obj = servers[server_name]
+                        for part in parts[:-1]:  # All but the last part are intermediate objects
+                            if not hasattr(current_obj, part):
+                                # Create a new nested namespace object
+                                nested_obj = type(part, (), {})()
+                                setattr(current_obj, part, nested_obj)
+                            current_obj = getattr(current_obj, part)
+                        # Set the final method on the deepest nested object
+                        setattr(current_obj, parts[-1], tool_func)
+                    else:
+                        # Simple case: no nested dots in method_name
+                        setattr(servers[server_name], method_name, tool_func)
                 else:
                     # Flat tool name (no server prefix)
                     self.namespace[tool_name] = tool_func
@@ -647,6 +669,10 @@ results directly when possible."""
         Returns:
             ExecutionResult with output and results
         """
+        # Log code being executed
+        code_preview = code[:200] if len(code) > 200 else code
+        logger.debug(f"Executing code (preview): {code_preview}")
+
         # Clear captured figures from previous execution
         self._captured_figures.clear()
 

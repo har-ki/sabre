@@ -97,6 +97,7 @@ class MCPTool:
     name: str
     description: str
     input_schema: dict[str, Any]  # JSON Schema for tool input
+    output_schema: Optional[dict[str, Any]] = None  # JSON Schema for tool output (MCP spec)
     server_name: str = ""  # Added by client manager during registration
 
     def get_signature(self) -> str:
@@ -126,6 +127,12 @@ class MCPTool:
                 "object": "dict",
             }
             python_type = type_map.get(param_type, "Any")
+
+            # For arrays, extract element type from "items" if available
+            if param_type == "array" and "items" in param_schema:
+                item_type = param_schema["items"].get("type", "Any")
+                item_python_type = type_map.get(item_type, "Any")
+                python_type = f"list[{item_python_type}]"
 
             # Add parameter with type hint
             if param_name in required:

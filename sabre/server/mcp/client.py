@@ -55,6 +55,12 @@ class MCPClient:
         self.next_id = 1
         self.connected = False
         self.tools_cache: Optional[list[MCPTool]] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None  # Store owning event loop
+
+    @property
+    def loop(self) -> Optional[asyncio.AbstractEventLoop]:
+        """Get the event loop that owns this client."""
+        return self._loop
 
     async def connect(self) -> None:
         """
@@ -68,6 +74,10 @@ class MCPClient:
             return
 
         try:
+            # Store the event loop that owns this client
+            self._loop = asyncio.get_running_loop()
+            logger.debug(f"[{self.config.name}] Storing owning loop: {hex(id(self._loop))}")
+
             # Step 1: Establish transport connection (stdio subprocess or HTTP client)
             if self.config.type == MCPTransportType.STDIO:
                 await self._connect_stdio()
@@ -321,6 +331,8 @@ class MCPClient:
                 return await self._send_stdio_request(request_json)
             elif self.config.type == MCPTransportType.SSE:
                 return await self._send_sse_request(request_json)
+            else:
+                raise MCPProtocolError(f"Unsupported transport type: {self.config.type}")
         except asyncio.TimeoutError as e:
             raise MCPTimeoutError(f"Request to {self.config.name} timed out") from e
         except Exception as e:
@@ -332,30 +344,50 @@ class MCPClient:
         if not self.process or not self.process.stdin or not self.process.stdout:
             raise MCPConnectionError("Process not available")
 
+        # Parse request to get request ID
+        request_data = json.loads(request_json)
+        request_id = request_data.get("id")
+
         # Write request to stdin
         self.process.stdin.write((request_json + "\n").encode())
         await self.process.stdin.drain()
 
-        # Read response from stdout (wait for timeout)
+        # Read responses from stdout until we get the matching ID
         try:
-            response_line = await asyncio.wait_for(self.process.stdout.readline(), timeout=self.config.timeout)
-            response_json = response_line.decode().strip()
+            max_attempts = 10  # Prevent infinite loop
+            for attempt in range(max_attempts):
+                response_line = await asyncio.wait_for(self.process.stdout.readline(), timeout=self.config.timeout)
+                response_json = response_line.decode().strip()
 
-            if not response_json:
-                raise MCPProtocolError("Empty response from server")
+                if not response_json:
+                    # Check if process died
+                    if self.process.returncode is not None:
+                        stderr_data = await self.process.stderr.read()
+                        raise MCPProtocolError(f"Process exited with code {self.process.returncode}. stderr: {stderr_data.decode()}")
+                    raise MCPProtocolError("Empty response from server")
 
-            logger.debug(f"[{self.config.name}] Received: {response_json}")
+                logger.debug(f"[{self.config.name}] Received: {response_json}")
 
-            # Parse JSON-RPC response
-            response_data = json.loads(response_json)
-            response = JSONRPCResponse(
-                jsonrpc=response_data.get("jsonrpc", "2.0"),
-                id=response_data.get("id"),
-                result=response_data.get("result"),
-                error=response_data.get("error"),
-            )
+                # Parse JSON-RPC response
+                response_data = json.loads(response_json)
+                response_id = response_data.get("id")
 
-            return response
+                # Check if this response matches our request
+                if response_id == request_id:
+                    response = JSONRPCResponse(
+                        jsonrpc=response_data.get("jsonrpc", "2.0"),
+                        id=response_id,
+                        result=response_data.get("result"),
+                        error=response_data.get("error"),
+                    )
+                    return response
+                else:
+                    # Response ID mismatch - this is a delayed response from a previous request
+                    logger.warning(f"[{self.config.name}] Response ID mismatch: expected {request_id}, got {response_id}. Skipping...")
+                    continue
+
+            # If we exhausted all attempts without finding matching response
+            raise MCPProtocolError(f"Failed to find matching response for request ID {request_id} after {max_attempts} attempts")
 
         except asyncio.TimeoutError:
             raise MCPTimeoutError(f"Request timed out after {self.config.timeout}s")
@@ -439,6 +471,7 @@ class MCPClient:
                 name=tool_data.get("name", ""),
                 description=tool_data.get("description", ""),
                 input_schema=tool_data.get("inputSchema", {}),
+                output_schema=tool_data.get("outputSchema"),  # Capture output schema from MCP spec
                 server_name=self.config.name,
             )
             tools.append(tool)

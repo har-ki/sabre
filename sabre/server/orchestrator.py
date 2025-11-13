@@ -148,6 +148,9 @@ class Orchestrator:
         full_response_text = ""
 
         logger.info(f"Starting orchestration for conversation {conversation_id}")
+        logger.info(f"Initial user input ({len(input_text)} chars): {input_text[:1000]}")
+        if len(input_text) > 1000:
+            logger.debug(f"Full user input: {input_text}")
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -165,6 +168,14 @@ class Orchestrator:
 
             # Get tree context for events
             tree_context = self._build_tree_context(tree, response_node, conversation_id)
+
+            # Log what's being sent to LLM for this iteration
+            if iteration == 1:
+                logger.debug(f"Iteration {iteration} - sending initial input to LLM")
+            else:
+                logger.info(f"Iteration {iteration} - continuation input ({len(current_input)} chars): {current_input[:500]}")
+                if len(current_input) > 500:
+                    logger.debug(f"Iteration {iteration} - full continuation input: {current_input}")
 
             # Emit response_start event
             if event_callback:
@@ -389,6 +400,14 @@ class Orchestrator:
 
         logger.info(f"Parsed response: {len(full_text)} chars, {len(helpers)} helpers")
         logger.info(f"Response text: {full_text[:500]}{'...' if len(full_text) > 500 else ''}")
+
+        # Log details about extracted helpers
+        if helpers:
+            for i, helper_code in enumerate(helpers, 1):
+                preview = helper_code[:100] if len(helper_code) > 100 else helper_code
+                logger.debug(f"Helper {i} preview: {preview}")
+        else:
+            logger.debug("No helpers extracted from response")
 
         # Emit response_text event with preview (not full text to reduce SSE payload)
         # Send first 500 + last 500 chars for preview, full text only in complete event

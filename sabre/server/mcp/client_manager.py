@@ -284,13 +284,16 @@ class MCPClientManager:
         """
         all_tools = {}
 
-        for name, client in self.clients.items():
+        for connector_id, client in self.clients.items():
             try:
+                # Get connector name from ID (for human-readable keys)
+                connector_name = self.id_to_name.get(connector_id, connector_id)
                 tools = await client.list_tools()
-                all_tools[name] = tools
+                all_tools[connector_name] = tools
             except Exception as e:
-                logger.error(f"Error getting tools from {name}: {e}")
-                all_tools[name] = []
+                connector_name = self.id_to_name.get(connector_id, connector_id)
+                logger.error(f"Error getting tools from {connector_name}: {e}")
+                all_tools[connector_name] = []
 
         return all_tools
 
@@ -304,10 +307,12 @@ class MCPClientManager:
         Returns:
             True if server is healthy
         """
-        if name not in self.clients:
+        # Get connector_id from name
+        connector_id = self.name_to_id.get(name)
+        if not connector_id or connector_id not in self.clients:
             return False
 
-        client = self.clients[name]
+        client = self.clients[connector_id]
 
         try:
             # Try to list tools as a health check
@@ -326,8 +331,9 @@ class MCPClientManager:
         """
         health_status = {}
 
-        for name in self.clients.keys():
-            health_status[name] = await self.health_check(name)
+        for connector_id in self.clients.keys():
+            connector_name = self.id_to_name.get(connector_id, connector_id)
+            health_status[connector_name] = await self.health_check(connector_name)
 
         return health_status
 
