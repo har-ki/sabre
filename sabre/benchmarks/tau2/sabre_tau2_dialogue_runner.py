@@ -42,76 +42,116 @@ def extract_tool_calls_from_helpers_code(helpers_code: str, block_idx: int = 0) 
     """
     import re
     import ast
+    import inspect
 
     tool_calls = []
 
     # Look for tau2_mcp.* calls
-    # Pattern: tau2_mcp.function_name(arg1=val1, arg2=val2, ...)
-    call_pattern = r'tau2_mcp\.(\w+)\((.*?)\)'
-    matches = re.finditer(call_pattern, helpers_code, re.DOTALL)
+    # Pattern: tau2_mcp.function_name(...)
+    # We need to match the full function call, handling nested parens
+    call_pattern = r'tau2_mcp\.(\w+)\s*\('
 
-    for match_idx, match in enumerate(matches):
+    for match in re.finditer(call_pattern, helpers_code):
         tool_name = match.group(1)
-        args_str = match.group(2).strip()
+        start_pos = match.end() - 1  # Position of opening '('
 
-        try:
-            # Parse arguments
-            args_dict = {}
-            if args_str:
-                # Try to parse Python function call arguments
-                # Handle simple cases: key=value, key="value", key='value'
-                arg_items = []
-                current_arg = ""
-                paren_depth = 0
-                in_string = False
-                string_char = None
+        # Find matching closing paren
+        paren_count = 1
+        pos = start_pos + 1
+        in_string = False
+        string_char = None
 
-                for char in args_str:
-                    if char in ['"', "'"]:
-                        if not in_string:
-                            in_string = True
-                            string_char = char
-                        elif char == string_char:
-                            in_string = False
-                    elif char == '(' and not in_string:
-                        paren_depth += 1
-                    elif char == ')' and not in_string:
-                        paren_depth -= 1
-                    elif char == ',' and paren_depth == 0 and not in_string:
-                        arg_items.append(current_arg.strip())
-                        current_arg = ""
-                        continue
-                    current_arg += char
+        while pos < len(helpers_code) and paren_count > 0:
+            char = helpers_code[pos]
 
-                if current_arg.strip():
-                    arg_items.append(current_arg.strip())
+            if char in ['"', "'"] and (pos == 0 or helpers_code[pos-1] != '\\'):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+            elif not in_string:
+                if char == '(':
+                    paren_count += 1
+                elif char == ')':
+                    paren_count -= 1
 
-                # Parse each argument
-                for arg in arg_items:
-                    if '=' in arg:
-                        key, val = arg.split('=', 1)
-                        key = key.strip()
-                        val = val.strip()
+            pos += 1
+
+        if paren_count == 0:
+            # Extract arguments string
+            args_str = helpers_code[start_pos + 1:pos - 1].strip()
+
+            try:
+                # Try to parse as Python function call using ast
+                # Create a fake function call to parse
+                fake_call = f"f({args_str})"
+                try:
+                    tree = ast.parse(fake_call, mode='eval')
+                    call_node = tree.body
+
+                    args_dict = {}
+
+                    # Handle positional arguments - need to map to parameter names
+                    # For tau2 tools, we'll use generic names or try to infer from tool schema
+                    for idx, arg in enumerate(call_node.args):
+                        # Try to evaluate the argument
                         try:
-                            # Try to safely evaluate the value
-                            args_dict[key] = ast.literal_eval(val)
+                            val = ast.literal_eval(ast.unparse(arg))
                         except:
-                            # If evaluation fails, keep as string (remove quotes)
-                            args_dict[key] = val.strip('"\'')
+                            val = ast.unparse(arg)
 
-            tool_calls.append({
-                "id": f"call_{block_idx}_{match_idx}_{tool_name}",
-                "name": tool_name,
-                "arguments": args_dict
-            })
-        except Exception as e:
-            logger.debug(f"Could not parse tool call arguments for {tool_name}: {e}")
-            # Add tool call without arguments
-            tool_calls.append({
-                "id": f"call_{block_idx}_{match_idx}_{tool_name}",
-                "name": tool_name,
-                "arguments": {}
-            })
+                        # For tau2 tools, common first parameter names:
+                        # - order_id, user_id, email, etc.
+                        # Use a generic name for now
+                        param_names = {
+                            'get_order_details': ['order_id'],
+                            'get_user_details': ['user_id'],
+                            'get_product_details': ['product_id'],
+                            'find_user_id_by_email': ['email'],
+                            'find_user_id_by_name_zip': ['first_name', 'last_name', 'zip'],
+                            'cancel_pending_order': ['order_id'],
+                            'modify_pending_order_address': ['order_id', 'address_line_1', 'address_line_2', 'city', 'state', 'country', 'zip'],
+                            'exchange_delivered_order_items': ['order_id', 'item_idx', 'new_product_id'],
+                            'return_delivered_order_items': ['order_id', 'item_idx'],
+                        }
+
+                        if tool_name in param_names and idx < len(param_names[tool_name]):
+                            args_dict[param_names[tool_name][idx]] = val
+                        else:
+                            args_dict[f'arg_{idx}'] = val
+
+                    # Handle keyword arguments
+                    for keyword in call_node.keywords:
+                        try:
+                            val = ast.literal_eval(ast.unparse(keyword.value))
+                        except:
+                            val = ast.unparse(keyword.value)
+                        args_dict[keyword.arg] = val
+
+                    tool_calls.append({
+                        "id": f"call_{block_idx}_{len(tool_calls)}_{tool_name}",
+                        "name": tool_name,
+                        "arguments": args_dict
+                    })
+
+                except Exception as e:
+                    logger.debug(f"Could not parse arguments for {tool_name} using AST: {e}")
+                    logger.debug(f"Arguments string: {args_str}")
+                    # Fall back to empty arguments
+                    tool_calls.append({
+                        "id": f"call_{block_idx}_{len(tool_calls)}_{tool_name}",
+                        "name": tool_name,
+                        "arguments": {}
+                    })
+
+            except Exception as e:
+                logger.debug(f"Could not extract arguments for {tool_name}: {e}")
+                tool_calls.append({
+                    "id": f"call_{block_idx}_{len(tool_calls)}_{tool_name}",
+                    "name": tool_name,
+                    "arguments": {}
+                })
 
     return tool_calls
 
@@ -185,7 +225,7 @@ async def run_sabre_dialogue_mode(
             "--domain", domain,
             "--task-id", task_id,
             "--dialogue-mode",  # Enable dialogue mode!
-            "--log-level", "ERROR"
+            "--log-level", "INFO"  # Changed to INFO to see debug logs
         ],
         env={"TAU2_DATA_DIR": tau2_data_dir},
     )
@@ -271,9 +311,17 @@ async def run_sabre_dialogue_mode(
                 print(f"   ⚠️ No message in response: {json.dumps(msg_data, indent=2)}")
                 raise RuntimeError(f"No message in tau2.get_next_message response")
             role = message["role"]
-            content = message["content"]
+            content = message.get("content", "")
 
-            print(f"   {role.upper()}: {content[:80]}...")
+            # Display message (handle None content)
+            content_preview = (content[:80] if content else "[no content]")
+            print(f"   {role.upper()}: {content_preview}...")
+
+            # Handle tool calls in user messages
+            if "tool_calls" in message and message["tool_calls"]:
+                print(f"   ⚠️ User message contains tool_calls - this indicates user simulator is trying to call tools")
+                print(f"   This shouldn't happen in normal flow. Tau2 might be confused.")
+
             conversation_history.append(message)
 
             # Handle messages based on role
@@ -283,17 +331,23 @@ async def run_sabre_dialogue_mode(
             # The next call to `get_next_message` will give us the user's response.
 
             if role == "assistant":
-                # tau2's dialogue mode: assistant sends greeting at turn=0
-                # We must send a message to advance the state machine
-                # Sending the greeting back ends conversation
-                # Sending "(Acknowledged)" works but creates weird conversation flow
-                #
-                # Solution: Send a proper agent greeting that's contextual to the task
-                print(f"   (Received assistant greeting - sending our own greeting)")
+                # Assistant messages in dialogue mode can be:
+                # 1. Initial greeting from tau2 (turn=0, no tool_calls)
+                # 2. Echo of our own message if there was an error (has tool_calls or turn > 0)
+
+                # Check if this is our own message being echoed back (error case)
+                if "tool_calls" in message and message["tool_calls"]:
+                    print(f"   ⚠️ Assistant message with tool_calls - likely an error echo, skipping")
+                    continue
+
+                if msg_data.get("turn", 0) > 0:
+                    print(f"   ⚠️ Assistant message at turn {msg_data.get('turn')} - unexpected, skipping")
+                    continue
+
+                # This is the initial greeting at turn 0
+                print(f"   (Received initial greeting from tau2)")
 
                 # Send a proper greeting that indicates we're ready to help
-                # Don't echo the exact greeting - tau2 treats that as a special signal
-                # Send a similar but different greeting
                 greeting_response = "Hello! I'm here to assist you. What can I help you with today?"
                 send_result = await client.call_tool("tau2.send_agent_message", {
                     "content": greeting_response,
@@ -301,21 +355,33 @@ async def run_sabre_dialogue_mode(
                 })
                 send_data = json.loads(send_result.content[0].text)
 
-                print(f"   DEBUG: Greeting send response = {json.dumps(send_data, indent=2)}")
-
                 if send_data.get("status") != "success":
-                    print(f"   ⚠️ Warning: send failed: {send_data}")
+                    print(f"   ⚠️ Warning: greeting send failed: {send_data}")
                     break
 
                 if not send_data.get("conversation_continues", True):
                     print(f"   ⚠️ Conversation ended after greeting")
-                    # This happens when we echo - but let's see what the evaluation says
                     break
 
                 continue
 
             elif role == "user":
                 # Agent's turn to respond to actual user message
+
+                # Handle user messages with tool_calls (user-side tool calls)
+                # In tau2, user simulator can call certain tools (e.g., find_user_id_by_name_zip)
+                # These are user-side tools that SABRE doesn't need to handle
+                # The tau2-mcp server should auto-execute these and return the next message
+                # But if we see them here, skip to next message
+                if "tool_calls" in message and message["tool_calls"]:
+                    print(f"   ℹ️  User simulator calling user-side tools (tau2 feature) - getting next message...")
+                    continue
+
+                if not content:
+                    print(f"   ⚠️ User message has no content and no tool_calls - unexpected state")
+                    print(f"   Ending dialogue.")
+                    break
+
                 print(f"   SABRE processing user message...")
 
                 # Create instructions for this turn
@@ -356,8 +422,17 @@ async def run_sabre_dialogue_mode(
 
                 # Extract tool calls from captured helpers blocks
                 tool_calls_executed = []
+                if captured_helpers and turn <= 3:
+                    print(f"   DEBUG: Captured {len(captured_helpers)} helpers blocks:")
+                    for idx, code in enumerate(captured_helpers):
+                        print(f"   DEBUG: Block {idx}:")
+                        print(f"   {code}")
+                        print(f"   ---")
+
                 for block_idx, helpers_code in enumerate(captured_helpers):
                     block_tools = extract_tool_calls_from_helpers_code(helpers_code, block_idx)
+                    if turn <= 3:
+                        print(f"   DEBUG: Block {block_idx} extracted {len(block_tools)} tool calls")
                     tool_calls_executed.extend(block_tools)
 
                 if tool_calls_executed:
@@ -365,29 +440,25 @@ async def run_sabre_dialogue_mode(
                     for tc in tool_calls_executed:
                         print(f"     - {tc['name']}({json.dumps(tc['arguments'])})")
 
-                # Send tool_calls to tau2-mcp for ACTION evaluation
-                # IMPORTANT: Set tools_already_executed=True because:
-                # 1. SABRE already executed the tools via MCP
-                # 2. tau2-mcp should add tool_calls to trajectory (for ACTION eval)
-                # 3. But should NOT execute them again (would cause double execution)
-                # 4. tau2-mcp will create placeholder ToolMessages in the trajectory
+                # Send response to tau2-mcp
+                # NOTE: We don't send tool_calls because:
+                # 1. SABRE already executed tools via MCP (results embedded in response)
+                # 2. Sending them would cause double execution by orchestrator
+                # 3. tau2 evaluation relies primarily on DB state changes
+                # 4. COMMUNICATE evaluation uses message content
+                # 5. ACTION evaluation may be limited but DB state is most accurate
                 payload = {
                     "content": agent_response,
-                    "tool_calls": tool_calls_executed,
-                    "tools_already_executed": True
+                    "tool_calls": []  # Don't send - tools already executed
                 }
-                if tool_calls_executed:
-                    print(f"   DEBUG: Sending {len(tool_calls_executed)} tool calls (already executed, for ACTION eval)")
-                else:
-                    print(f"   DEBUG: Sending response (no tool calls)")
 
                 send_result = await client.call_tool("tau2.send_agent_message", payload)
                 send_data = json.loads(send_result.content[0].text)
 
-                print(f"   DEBUG: Response = {json.dumps(send_data, indent=2)}")
-
                 if send_data.get("status") != "success":
                     print(f"   ⚠️ Warning: send_agent_message returned: {send_data}")
+                    # If there's an error, the dialogue may not be able to continue
+                    break
 
                 # Check if conversation should continue
                 if not send_data.get("conversation_continues", True):
