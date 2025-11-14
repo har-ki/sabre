@@ -864,8 +864,9 @@ class Orchestrator:
         self.system_instructions = instructions
 
         logger.info(f"Creating conversation with instructions ({len(instructions)} chars)")
-        logger.info(f"Instructions first 3000 chars:\n{instructions[:3000]}")
-        logger.info(f"Instructions last 1000 chars:\n...{instructions[-1000:]}")
+        # Verbose instruction logging disabled to reduce log noise
+        # logger.debug(f"Instructions first 3000 chars:\n{instructions[:3000]}")
+        # logger.debug(f"Instructions last 1000 chars:\n...{instructions[-1000:]}")
 
         # Send initial message with instructions
         # NOTE: Instructions must be sent on EVERY response.create() call

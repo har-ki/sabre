@@ -225,7 +225,7 @@ async def run_sabre_dialogue_mode(
             "--domain", domain,
             "--task-id", task_id,
             "--dialogue-mode",  # Enable dialogue mode!
-            "--log-level", "INFO"  # Changed to INFO to see debug logs
+            "--log-level", "DEBUG"  # DEBUG to see initialization flow
         ],
         env={"TAU2_DATA_DIR": tau2_data_dir},
     )
@@ -474,15 +474,22 @@ async def run_sabre_dialogue_mode(
 
         print(f"   ✓ Evaluation complete")
 
+        # Extract reward breakdown if available
+        # Note: reward_breakdown contains the full reward_info dict from tau2-mcp
+        reward_breakdown = eval_data.get("reward_breakdown", {})
+        db_reward = reward_breakdown.get("db_reward", reward_breakdown.get("DB"))
+        communicate_reward = reward_breakdown.get("communicate_reward", reward_breakdown.get("COMMUNICATE"))
+        action_reward = reward_breakdown.get("action_reward", reward_breakdown.get("ACTION"))
+
         # Display results
         print(f"\n{'='*70}")
         print(f"Dialogue Mode Evaluation Results")
         print(f"{'='*70}")
         print(f"tau2 Score:          {eval_data.get('score', 'N/A')}")
         print(f"tau2 Correct:        {eval_data.get('correct', 'N/A')}")
-        print(f"DB Reward:           {eval_data.get('db_reward', 'N/A')}")
-        print(f"COMMUNICATE Reward:  {eval_data.get('communicate_reward', 'N/A')}")
-        print(f"ACTION Reward:       {eval_data.get('action_reward', 'N/A')}")
+        print(f"DB Reward:           {db_reward if db_reward is not None else 'N/A'}")
+        print(f"COMMUNICATE Reward:  {communicate_reward if communicate_reward is not None else 'N/A'}")
+        print(f"ACTION Reward:       {action_reward if action_reward is not None else 'N/A'}")
         print(f"Details:             {eval_data.get('details', 'N/A')}")
         print(f"Conversation Turns:  {turn}")
         print(f"{'='*70}\n")
@@ -493,12 +500,13 @@ async def run_sabre_dialogue_mode(
             "mode": "dialogue",
             "tau2_score": eval_data["score"],
             "tau2_correct": eval_data["correct"],
-            "db_reward": eval_data.get("db_reward"),
-            "communicate_reward": eval_data.get("communicate_reward"),
-            "action_reward": eval_data.get("action_reward"),
+            "db_reward": db_reward,
+            "communicate_reward": communicate_reward,
+            "action_reward": action_reward,
             "details": eval_data["details"],
             "conversation_turns": turn,
             "conversation_history": conversation_history,
+            "reward_breakdown": reward_breakdown,
         }
 
     finally:

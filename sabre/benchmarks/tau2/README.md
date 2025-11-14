@@ -160,3 +160,26 @@ def _create_instructions(mcp_adapter):
 - `TAU2_DATA_DIR` environment variable set
 - OpenAI API key set via `OPENAI_API_KEY`
 - tau2-mcp server available in PATH or at expected location
+
+## Key Fixes
+
+### Tool Documentation Conflict Resolution
+
+**Issue**: MCP tool documentation for `exchange_delivered_order_items` and `return_delivered_order_items` contained instructions to "ask for explicit user confirmation", which conflicted with the system prompt telling SABRE to execute immediately.
+
+**Fix**: Added explicit override instructions in `retail_agent_base.prompt` that tell SABRE to ignore the "ask for confirmation" requirement in tool documentation and treat the customer's request as their confirmation.
+
+**See**: [TOOL_DOCUMENTATION_CONFLICT_FIX.md](TOOL_DOCUMENTATION_CONFLICT_FIX.md)
+
+### Reward Breakdown Display
+
+**Issue**: The dialogue runner was displaying "N/A" for all reward components (DB, COMMUNICATE, ACTION) even though tau2-mcp was calculating them correctly.
+
+**Fix**: Updated the dialogue runner to properly extract individual reward values from the nested `reward_breakdown` dict in the evaluation response.
+
+**Result**: Now properly displays:
+- DB Reward: 1.0 (database state evaluation)
+- COMMUNICATE Reward: 1.0 (communication quality)
+- ACTION Reward: N/A (not evaluated in dialogue mode)
+
+**See**: [REWARD_DISPLAY_FIX.md](REWARD_DISPLAY_FIX.md)
