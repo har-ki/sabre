@@ -6,16 +6,19 @@ This directory contains SABRE's integration with the [tau2-bench](https://github
 
 ```
 sabre/benchmarks/tau2/
-├── README.md                      # This file
-├── README_API.md                  # API runner documentation (recommended!)
-├── __init__.py                    # Package exports
-├── sabre_tau2_runner.py           # Internal runner (direct component usage)
-├── sabre_tau2_api_runner.py       # API runner (uses HTTP API) ⭐ RECOMMENDED
-├── run_tau2_eval.sh               # Shell script for internal runner
-├── run_tau2_eval_api.sh           # Shell script for API runner ⭐ RECOMMENDED
-├── example_api_usage.py           # Example code for API runner
+├── README.md                       # This file
+├── README_API.md                   # API runner documentation (recommended!)
+├── __init__.py                     # Package exports
+├── sabre_tau2_dialogue_runner.py   # Dialogue mode runner (current implementation)
+├── sabre_tau2_batch_runner.py      # Batch evaluation runner 🚀
+├── sabre_tau2_runner.py            # Internal runner (direct component usage)
+├── sabre_tau2_api_runner.py        # API runner (uses HTTP API)
+├── run_tau2_eval.sh                # Shell script for single task evaluation
+├── run_tau2_batch.sh               # Shell script for batch evaluation 🚀
+├── run_tau2_eval_api.sh            # Shell script for API runner
+├── example_api_usage.py            # Example code for API runner
 └── prompts/
-    └── retail_agent_base.prompt   # Generic retail agent (reusable!)
+    └── retail_agent_base.prompt    # Generic retail agent (reusable!)
 ```
 
 ## Quick Start
@@ -42,7 +45,7 @@ uv run python -m sabre.benchmarks.tau2.sabre_tau2_api_runner task_0 --model gpt-
 
 **See [README_API.md](README_API.md) for complete API runner documentation.**
 
-### Alternative: Internal Runner (Direct Component Usage)
+### Alternative: Dialogue Mode Runner (Direct Internal Usage)
 
 ```bash
 # Set environment variables
@@ -53,10 +56,52 @@ export TAU2_DATA_DIR=/path/to/tau2-bench/data
 ./sabre/benchmarks/tau2/run_tau2_eval.sh 0 --model gpt-4o-mini --domain retail
 
 # Or use Python directly
-uv run python -m sabre.benchmarks.tau2.sabre_tau2_runner task_0 --model gpt-4o-mini --domain retail
+uv run python -m sabre.benchmarks.tau2.sabre_tau2_dialogue_runner 0 --model gpt-4o-mini --domain retail
+```
 
-# Run batch evaluation
-uv run python -m sabre.benchmarks.tau2.sabre_tau2_runner task_0 task_1 task_2 --model gpt-4o-mini --domain retail
+### 🚀 Batch Evaluation (Run Multiple Tasks)
+
+Run multiple tasks in one go and get comprehensive reports:
+
+```bash
+# Set environment variables
+export OPENAI_API_KEY=your-api-key
+export TAU2_DATA_DIR=/path/to/tau2-bench/data
+
+# Run first 10 retail tasks
+./sabre/benchmarks/tau2/run_tau2_batch.sh --num-tasks 10 --model gpt-4o-mini --output results/batch_10.json
+
+# Run tasks 0-19
+./sabre/benchmarks/tau2/run_tau2_batch.sh --start 0 --end 20 --model gpt-4o-mini --output results/batch_0_20.json
+
+# Run ALL retail tasks (114 tasks)
+./sabre/benchmarks/tau2/run_tau2_batch.sh --all --model gpt-4o-mini --output results/all_retail.json
+
+# Or use Python directly
+uv run python -m sabre.benchmarks.tau2.sabre_tau2_batch_runner --num-tasks 5 --model gpt-4o-mini --output results.json
+```
+
+**Batch Output**: Generates two files:
+- `results.json` - Full detailed results in JSON format (for programmatic analysis)
+- `results.txt` - Human-readable report with summary statistics and per-task breakdowns
+
+**Example Report**:
+```
+======================================================================
+BATCH EVALUATION SUMMARY
+======================================================================
+Total Tasks:       10
+Passed:            8 (80.0%)
+Failed:            2
+Errors:            0
+======================================================================
+Average tau2 Score:         0.850
+Average DB Reward:          0.900
+Average COMMUNICATE Reward: 0.950
+Average Conversation Turns: 5.2
+======================================================================
+Elapsed Time: 245.3s (4.1 minutes)
+======================================================================
 ```
 
 ## Architecture
