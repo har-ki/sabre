@@ -59,6 +59,8 @@ dependencies = [
     # Common dependencies
     "typing-extensions>=4.12.2",
     "pydantic-core>=2.18.0",
+    "inspect-ai>=0.3.145",
+    "inspect-evals",
 ]
 
 [project.urls]
@@ -90,6 +92,9 @@ dev-dependencies = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=4.1.0",
 ]
+
+[tool.uv.sources]
+inspect-evals = { git = "https://github.com/UKGovernmentBEIS/inspect_evals.git" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

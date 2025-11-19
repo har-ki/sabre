@@ -6,6 +6,7 @@ as a drop-in replacement for OpenAI's API.
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -213,6 +214,18 @@ async def _complete_chat_completion(
     # Load instructions for new conversation
     instructions = manager.orchestrator.load_default_instructions()
 
+    # Add mandatory helper usage instruction for benchmarks (shortened for token efficiency)
+    mandatory_helpers_prefix = """CRITICAL: You MUST use <helpers></helpers> blocks for this task. Use Search.web_search() for external data, download() for URLs, and Python for ALL calculations. Never do mental math. Example:
+<helpers>
+results = Search.web_search("query")
+data = llm_call([download(results)[0]], "extract value")
+answer = calculate(data)
+result(answer)
+</helpers>
+
+"""
+    instructions = mandatory_helpers_prefix + instructions
+
     # Run orchestration
     try:
         result = await manager.orchestrator.run(
@@ -257,6 +270,41 @@ async def _complete_chat_completion(
             "total_tokens": input_tokens + output_tokens,
         },
     }
+
+    # Uncomment below for Gaia tests
+    #
+    # return {
+    #     "id": completion_id,
+    #     "object": "chat.completion",
+    #     "created": created,
+    #     "model": model_name,
+    #     "choices": [
+    #         {
+    #             "index": 0,
+    #             "message": {
+    #                 "role": "assistant",
+    #                 "content": None,  # ← Must be None when using tool_calls
+    #                 "tool_calls": [
+    #                     {
+    #                         "id": f"call_{uuid.uuid4().hex[:24]}",
+    #                         "type": "function",
+    #                         "function": {
+    #                             "name": "submit",
+    #                             "arguments": json.dumps({"answer": response_text})
+    #                         }
+    #                     }
+    #                 ]
+    #             },
+    #             "finish_reason": "tool_calls",  # ← Should be "tool_calls", not "stop"
+    #             "logprobs": None,
+    #         }
+    #     ],
+    #     "usage": {
+    #         "prompt_tokens": input_tokens,
+    #         "completion_tokens": output_tokens,
+    #         "total_tokens": input_tokens + output_tokens,
+    #     },
+    # }
 
 
 async def _stream_chat_completion(manager, user_input: str, completion_id: str, created: int, model_name: str):

@@ -1113,7 +1113,7 @@ class Orchestrator:
 
         def replacer(match):
             nonlocal result_index
-            logger.info(f"DEBUG: replacer called for match {result_index}, matched text: {match.group(0)[:100]}")
+            logger.info(f"DEBUG: replacer called for match {result_index}, matched text: {match.group(0)}")
             if result_index < len(results):
                 output_text, content_items = results[result_index]
                 logger.info(
