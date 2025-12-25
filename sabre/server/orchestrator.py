@@ -125,6 +125,7 @@ class Orchestrator:
         tree: ExecutionTree,
         session_id: str,
         instructions: str | None = None,
+        attachments: list | None = None,
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 1.0,
@@ -139,6 +140,7 @@ class Orchestrator:
             tree: Execution tree for tracking
             session_id: Session ID for logging (required - flows through all nested calls)
             instructions: System instructions for the conversation (required if conversation_id is None)
+            attachments: Optional list of Content objects (TextContent, ImageContent, FileContent)
             model: Model to use (optional)
             max_tokens: Max output tokens
             temperature: Temperature
@@ -147,6 +149,48 @@ class Orchestrator:
         Returns:
             OrchestrationResult with final response
         """
+        # Process attachments into structured input
+        from sabre.common.models.messages import FileContent, ImageContent, TextContent
+
+        image_refs = []
+        text_parts = [input_text]
+
+        if attachments:
+            for content in attachments:
+                if isinstance(content, ImageContent):
+                    # Upload image to Files API for token efficiency
+                    if not content.is_file_reference:
+                        # Base64 image data - need to upload
+                        logger.info("📤 Uploading image to Files API (base64 → file_id for token efficiency)")
+                        file_id = await self._upload_image_to_files_api(content)
+                        image_refs.append(ImageContent(file_id=file_id))
+                    else:
+                        # Already a file_id reference
+                        logger.info(f"📎 Image already uploaded: {content.file_id}")
+                        image_refs.append(content)
+
+                elif isinstance(content, TextContent):
+                    # Append text content to prompt
+                    logger.info("📄 Adding text content to prompt")
+                    text_parts.append(content.text)
+
+                elif isinstance(content, FileContent):
+                    # Describe the file
+                    logger.info(f"📦 Adding file description: {content.filename}")
+                    text_parts.append(content.get_str())
+
+        # Build structured input for first iteration
+        if image_refs:
+            # Tuple format: (text, list[ImageContent])
+            structured_input = ("\n\n".join(text_parts), image_refs)
+            logger.info(
+                f"📥 Built structured input: {len(text_parts)} text parts, {len(image_refs)} images → tuple format"
+            )
+        else:
+            # Plain text
+            structured_input = "\n\n".join(text_parts)
+            logger.info(f"📝 Built plain text input: {len(structured_input)} chars")
+
         # Create conversation if needed
         if conversation_id is None:
             if not instructions:
@@ -157,7 +201,7 @@ class Orchestrator:
 
         iteration = 0
         current_response_id = None
-        current_input = input_text
+        current_input = structured_input  # Use structured input for first iteration
         full_response_text = ""
         iteration_start_time = time.time()
 
@@ -166,12 +210,13 @@ class Orchestrator:
         # Log user message (only on first iteration, not for continuations)
         if self.session_logger and iteration == 0:
             root_node = tree.current
+            # Log the original text message (not the full structured input with attachments)
             self.session_logger.log_user_message(
                 session_id=session_id,
                 node_id=root_node.id if root_node else "root",
                 parent_id=root_node.parent_id if root_node else None,
                 depth=tree.get_depth(),
-                message=str(input_text),  # Full message, not truncated
+                message=str(input_text),  # Log original input text, not full message
             )
 
         while iteration < self.max_iterations:
@@ -307,7 +352,10 @@ class Orchestrator:
                 final_message = full_response_text
 
                 # Emit complete event
-                await self._emit_complete_event(tree_context, final_message, event_callback)
+                from sabre.common.paths import get_session_workspace_dir
+
+                workspace_dir = str(get_session_workspace_dir(session_id))
+                await self._emit_complete_event(tree_context, final_message, session_id, workspace_dir, event_callback)
 
                 return OrchestrationResult(
                     success=True,
@@ -590,9 +638,16 @@ class Orchestrator:
                     metadata={"block_number": i + 1, "code": code},  # Full code, not truncated
                 )
 
+            # Extract helper name from code for better labeling
+            helper_name = self._extract_helper_name(code)
+
             # Emit start event
             if event_callback:
-                await event_callback(HelpersExecutionStartEvent(**helper_tree_context, code=code, block_number=i + 1))
+                await event_callback(
+                    HelpersExecutionStartEvent(
+                        **helper_tree_context, code=code, block_number=i + 1, helper_name=helper_name
+                    )
+                )
                 # Yield control to event loop so SSE generator can process queue
                 await asyncio.sleep(0)
 
@@ -630,14 +685,15 @@ class Orchestrator:
 
                 conversation_id = helper_tree_context["conversation_id"]
                 # Count existing files for this conversation to determine message number
+                # New format: file_{conv_id}_msg{msg_num}_{helper_name}_hlp{hlp_num}_{img_num}.png
+                # Old format: file_{conv_id}_msg{msg_num}_hlp{hlp_num}_{img_num}.png
                 existing_files = glob.glob(str(files_dir / f"file_{conversation_id}_msg*.png"))
 
-                # Extract message numbers from filenames (file_{conv_id}_msg1_hlp1_1.png -> 1)
+                # Extract message numbers from filenames
                 message_nums = set()
                 for file_path in existing_files:
                     filename = Path(file_path).name
-                    # Expected format: file_{conv_id}_msg{msg_num}_hlp{hlp_num}_{img_num}.png
-                    # Find the msg number
+                    # Find the msg number (works for both old and new formats)
                     if "_msg" in filename:
                         try:
                             msg_part = filename.split("_msg")[1].split("_")[0]
@@ -646,16 +702,41 @@ class Orchestrator:
                             pass
                 message_num = (max(message_nums) + 1) if message_nums else 1
 
+                # Extract helper name from the code (for better filenames)
+                helper_name = self._extract_helper_name(code)
+
                 for item in result.content:
                     if isinstance(item, ImageContent) and item.image_data:
                         # Save image to disk and get URL
-                        # Format: file_{conv_id}_msg{message_num}_hlp{helper_num}_{image_num}.png
-                        # i+1 is helper number, len(image_urls)+1 is image number
-                        filename = f"file_{conversation_id}_msg{message_num}_hlp{i + 1}_{len(image_urls) + 1}.png"
+                        # Format: file_{conv_id}_msg{message_num}_{helper_name}_hlp{helper_num}_{image_num}.png
+                        # This allows tracking which helper generated the image
+                        filename = f"file_{conversation_id}_msg{message_num}_{helper_name}_hlp{i + 1}_{len(image_urls) + 1}.png"
                         url = self._save_image_to_disk(
                             item, session_id, helper_tree_context["conversation_id"], filename
                         )
                         image_urls.append(url)
+
+                        # Log the file save to session.jsonl
+                        if self.session_logger:
+                            files_dir = get_session_files_dir(session_id)
+                            file_path = files_dir / filename
+
+                            self.session_logger.log_file_saved(
+                                session_id=session_id,
+                                filename=filename,
+                                file_path=str(file_path),
+                                file_type="image",
+                                context=f"helper_result_{helper_name}",
+                                metadata={
+                                    "mime_type": item.mime_type,
+                                    "size_bytes": len(base64.b64decode(item.image_data)) if item.image_data else 0,
+                                    "helper_name": helper_name,
+                                    "message_num": message_num,
+                                    "helper_num": i + 1,
+                                    "image_num": len(image_urls),
+                                },
+                            )
+
                         # Keep original base64 ImageContent for Files API upload
                         saved_content.append(item)
                     else:
@@ -678,9 +759,7 @@ class Orchestrator:
                 if len(output_text_for_llm) > MAX_INLINE_CHARS:
                     logger.info(f"Result is large ({len(output_text_for_llm)} chars), saving to file for LLM reference")
                     # Save to file and upload to Files API
-                    file_id = await self._save_large_result_to_file(
-                        output_text_for_llm, helper_tree_context["conversation_id"], i + 1
-                    )
+                    file_id = await self._save_large_result_to_file(output_text_for_llm, session_id, i + 1)
                     # Replace with file reference for LLM (show preview + file_id)
                     output_text_for_llm = (
                         f"[Large result ({len(output_text_for_llm)} chars) uploaded to file_id: {file_id}]\n\n"
@@ -738,6 +817,7 @@ class Orchestrator:
                             success=True,
                             result=display_content,
                             block_number=i + 1,
+                            helper_name=helper_name,
                         )
                     )
                     # Yield control to event loop so SSE generator can process queue
@@ -774,6 +854,7 @@ class Orchestrator:
                             success=False,
                             result=[TextContent(error_text)],
                             block_number=i + 1,
+                            helper_name=helper_name,
                         )
                     )
 
@@ -886,7 +967,12 @@ class Orchestrator:
     # ============================================================
 
     async def _emit_complete_event(
-        self, tree_context: dict, final_message: str, callback: Callable[[Event], Awaitable[None]] | None
+        self,
+        tree_context: dict,
+        final_message: str,
+        session_id: str,
+        workspace_dir: str,
+        callback: Callable[[Event], Awaitable[None]] | None,
     ):
         """
         Emit completion event.
@@ -894,10 +980,19 @@ class Orchestrator:
         Args:
             tree_context: Tree context dict
             final_message: Final response text
+            session_id: Session ID for this execution
+            workspace_dir: Workspace directory path for this session
             callback: Event callback
         """
         if callback:
-            await callback(CompleteEvent(**tree_context, final_message=final_message))
+            await callback(
+                CompleteEvent(
+                    **tree_context,
+                    final_message=final_message,
+                    session_id=session_id,
+                    workspace_dir=workspace_dir,
+                )
+            )
 
     def _get_openai_client(self):
         """
@@ -1028,6 +1123,39 @@ class Orchestrator:
     # FILE MANAGEMENT
     # ============================================================
 
+    def _extract_helper_name(self, code: str) -> str:
+        """
+        Extract helper name from code for better labeling.
+
+        Args:
+            code: Python code to analyze
+
+        Returns:
+            Helper name (e.g., 'download', 'matplotlib', 'llm_call') or 'unknown'
+        """
+        try:
+            # Simple heuristic: look for common helper patterns in the code
+            code_lower = code.lower()
+            if "download(" in code_lower:
+                return "download"
+            elif "search.web_search(" in code_lower or "search(" in code_lower:
+                return "search"
+            elif "web.get_url(" in code_lower:
+                return "web"
+            elif "plt." in code_lower or "matplotlib" in code_lower:
+                return "matplotlib"
+            elif "llm_call(" in code_lower:
+                return "llm_call"
+            elif "sabre_call(" in code_lower:
+                return "sabre_call"
+            elif "bash.execute(" in code_lower:
+                return "bash"
+            elif "result(" in code_lower:
+                return "result"
+            return "unknown"
+        except Exception:
+            return "unknown"
+
     def _save_image_to_disk(
         self, image_content: ImageContent, session_id: str, conversation_id: str, filename: str
     ) -> str:
@@ -1107,7 +1235,7 @@ class Orchestrator:
             logger.error(f"Failed to upload image to Files API: {e}")
             raise
 
-    async def _save_large_result_to_file(self, content: str, conversation_id: str, helper_num: int) -> str:
+    async def _save_large_result_to_file(self, content: str, session_id: str, helper_num: int) -> str:
         """
         Save large helper result to file and upload to Files API.
 
@@ -1116,7 +1244,7 @@ class Orchestrator:
 
         Args:
             content: Large text content to save
-            conversation_id: Conversation ID for directory organization
+            session_id: Session ID for directory organization
             helper_num: Helper number for unique filename
 
         Returns:
@@ -1125,11 +1253,11 @@ class Orchestrator:
         Raises:
             Exception if upload fails
         """
-        from sabre.common.paths import get_files_dir
+        from sabre.common.paths import get_session_files_dir
         import io
 
         # Save to disk first
-        files_dir = get_files_dir(conversation_id)
+        files_dir = get_session_files_dir(session_id)
         files_dir.mkdir(parents=True, exist_ok=True)
 
         filename = f"helper_{helper_num}_result.txt"

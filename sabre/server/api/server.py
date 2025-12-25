@@ -7,8 +7,10 @@ HTTP SSE-based server that handles chat messages and streams back responses.
 import asyncio
 import datetime
 import json
+import jsonpickle
 import logging
 import os
+import platform
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -16,7 +18,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-import jsonpickle
 
 from sabre.common import (
     ResponseExecutor,
@@ -233,7 +234,17 @@ async def check_playwright_installation():
             raise RuntimeError("Could not determine required chromium version")
 
         # Check if chromium_headless_shell is installed
-        playwright_cache = Path.home() / "Library" / "Caches" / "ms-playwright"
+        # Try platform-specific paths
+        system = platform.system()
+        if system == "Darwin":  # macOS
+            playwright_cache = Path.home() / "Library" / "Caches" / "ms-playwright"
+        elif system == "Linux":
+            playwright_cache = Path.home() / ".cache" / "ms-playwright"
+        elif system == "Windows":
+            playwright_cache = Path.home() / "AppData" / "Local" / "ms-playwright"
+        else:
+            playwright_cache = Path.home() / ".cache" / "ms-playwright"  # Default to Linux path
+
         headless_dir = playwright_cache / f"chromium_headless_shell-{chromium_version}"
 
         if not headless_dir.exists():
@@ -380,6 +391,47 @@ async def get_session_data(session_id: str):
     return FileResponse(session_file, media_type="application/x-ndjson")
 
 
+@app.get("/v1/sessions/{session_id}/atif")
+async def get_session_atif(session_id: str, model: str = None):
+    """
+    Get session in ATIF (Agent Trajectory Interchange Format) v1.2.
+
+    ATIF is a standardized format for representing agent execution traces,
+    used by Harbor, Terminal-Bench, and other benchmarking frameworks.
+
+    Query Parameters:
+        model: Optional model name to include in agent metadata (default: from env OPENAI_MODEL)
+
+    Returns:
+        JSON response with ATIF-formatted trajectory
+
+    Security:
+        - Only serves sessions from session directories
+        - Returns 404 for non-existent sessions
+    """
+    from sabre.server.atif_export import events_to_atif
+    import os
+
+    # Load session events
+    events = manager.session_logger.get_session(session_id)
+
+    if not events:
+        raise HTTPException(status_code=404, detail="Session not found or has no events")
+
+    # Get model name from query param, env, or default
+    model_name = model or os.environ.get("OPENAI_MODEL", "gpt-4o")
+
+    # Convert to ATIF
+    atif = events_to_atif(
+        events,
+        agent_name="sabre",
+        agent_version="latest",  # TODO: Get from package version
+        model_name=model_name,
+    )
+
+    return atif
+
+
 @app.get("/v1/sessions/{session_id}/files")
 async def list_session_files(session_id: str):
     """
@@ -469,13 +521,36 @@ async def message_endpoint(request: Request):
     """
     HTTP SSE endpoint for chat messages.
 
-    Client POSTs: {"type": "message", "content": "user message text", "session_id": "..."|null}
+    Client POSTs: {"type": "message", "content": "user message text", "session_id": "..."|null, "attachments": "..."|null}
     Server streams: SSE events with jsonpickle-encoded Event objects
     """
     data = await request.json()
     user_message = data.get("content", "")
     conversation_id = data.get("conversation_id")
     session_id = data.get("session_id")
+    attachments_json = data.get("attachments")
+
+    # Deserialize attachments if present
+    attachments = []
+    if attachments_json:
+        try:
+            attachments = jsonpickle.decode(attachments_json)
+            logger.info(f"Received {len(attachments)} attachments")
+        except Exception as e:
+            error_msg = str(e)  # Capture the error message for async function
+            logger.error(f"Failed to deserialize attachments: {e}")
+
+            # Return error as SSE stream
+            async def error_stream():
+                from sabre.common.models.events import ErrorEvent
+
+                error_event = ErrorEvent(
+                    error_type="deserialization_error", message=f"Failed to deserialize attachments: {error_msg}"
+                )
+                yield f"data: {jsonpickle.encode(error_event)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(error_stream(), media_type="text/event-stream")
 
     # Generate session ID if not provided (new session)
     if not session_id:
@@ -550,6 +625,7 @@ async def message_endpoint(request: Request):
                     result = await manager.orchestrator.run(
                         conversation_id=conversation_id,  # None for first message
                         input_text=user_message,
+                        attachments=attachments if attachments else None,  # Pass attachments
                         tree=tree,
                         instructions=instructions,  # Required for new conversations
                         event_callback=event_callback,

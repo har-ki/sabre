@@ -207,25 +207,41 @@ class TUI:
         """Print code block with syntax highlighting and line numbers."""
         indent = "  "
 
-        # Use Pygments for syntax highlighting (without built-in line numbers)
-        formatter = Terminal256Formatter(
-            style=self.colors["pygments_style"],
-        )
+        # Check for NO_COLOR environment variable
+        no_color = os.environ.get("NO_COLOR")
 
-        # Highlight the code
-        highlighted = highlight(code, PythonLexer(), formatter)
+        if no_color:
+            # No syntax highlighting - just print plain code with line numbers
+            lines = code.rstrip("\n").split("\n")
+            max_line_num = len(lines)
+            # Calculate width needed for line numbers (minimum 2 characters)
+            line_num_width = max(2, len(str(max_line_num)))
 
-        # Add line numbers manually with right-alignment
-        lines = highlighted.rstrip("\n").split("\n")
-        max_line_num = len(lines)
-        # Calculate width needed for line numbers (minimum 2 characters)
-        line_num_width = max(2, len(str(max_line_num)))
+            for i, line in enumerate(lines, 1):
+                # Right-align line number with padding, then add spacing before code
+                line_num_str = str(i).rjust(line_num_width)
+                print(f"{indent}  {line_num_str}  {line}")
+                sys.stdout.flush()
+        else:
+            # Use Pygments for syntax highlighting (without built-in line numbers)
+            formatter = Terminal256Formatter(
+                style=self.colors["pygments_style"],
+            )
 
-        for i, line in enumerate(lines, 1):
-            # Right-align line number with padding, then add spacing before code
-            line_num_str = str(i).rjust(line_num_width)
-            print(f"{indent}  {line_num_str}  {line}")
-            sys.stdout.flush()
+            # Highlight the code
+            highlighted = highlight(code, PythonLexer(), formatter)
+
+            # Add line numbers manually with right-alignment
+            lines = highlighted.rstrip("\n").split("\n")
+            max_line_num = len(lines)
+            # Calculate width needed for line numbers (minimum 2 characters)
+            line_num_width = max(2, len(str(max_line_num)))
+
+            for i, line in enumerate(lines, 1):
+                # Right-align line number with padding, then add spacing before code
+                line_num_str = str(i).rjust(line_num_width)
+                print(f"{indent}  {line_num_str}  {line}")
+                sys.stdout.flush()
 
     # ==================== Event Rendering Methods ====================
 
@@ -374,16 +390,54 @@ class TUI:
                     elif url.startswith("data:image"):
                         self._render_image(url, alt_text)
 
+        # Session info is now displayed at the beginning of the session
+        # (see client.py ResponseStartEvent handler)
+
     # ==================== Image Rendering ====================
 
     def _render_image_url(self, url: str):
         """Render image URL - imgcat in WezTerm, otherwise show URL."""
         import subprocess
         import urllib.request
+        import re
 
         term_program = os.environ.get("TERM_PROGRAM", "")
         is_wezterm = term_program.lower() == "wezterm"
 
+        # Convert localhost URLs to local file paths
+        # URL format: http://localhost:8011/v1/sessions/{session_id}/files/{filename}
+        localhost_pattern = r"http://localhost:\d+/v1/sessions/([^/]+)/files/(.+)"
+        match = re.match(localhost_pattern, url)
+
+        if match:
+            session_id = match.group(1)
+            filename = match.group(2)
+            # Construct local file path
+            from sabre.common.paths import get_session_files_dir
+
+            files_dir = get_session_files_dir(session_id)
+            local_path = files_dir / filename
+
+            if local_path.exists():
+                # Use local file path directly
+                if is_wezterm:
+                    try:
+                        # Use local file path with wezterm imgcat
+                        subprocess.run(["wezterm", "imgcat", str(local_path)], check=True)
+                        logger.info(f"Rendered image via wezterm imgcat: {local_path}")
+                        return
+                    except Exception as e:
+                        logger.error(f"Failed to imgcat {local_path}: {e}")
+                        self.print(f'<style fg="{self.colors["result"]}">{url}</style>')
+                        return
+                else:
+                    # Show local path instead of URL
+                    self.print(f'<style fg="{self.colors["result"]}">{local_path}</style>')
+                    return
+            else:
+                logger.warning(f"Local file not found: {local_path}, falling back to URL")
+
+        # Fallback: try to download from URL (for remote images)
         if is_wezterm:
             try:
                 # Download image and pipe to wezterm imgcat

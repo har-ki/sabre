@@ -45,6 +45,11 @@ class Client:
         self.current_request_id: str | None = None
         self.conversation_id: str | None = None
 
+        # Track session info (displayed at start of each conversation)
+        self.session_id: str | None = None
+        self.workspace_dir: str | None = None
+        self.session_info_displayed = False
+
         # Create styled prompt session
         prompt_style = PromptStyle.from_dict(
             {
@@ -166,6 +171,30 @@ class Client:
 
     async def send_message(self, client: httpx.AsyncClient, user_input: str):
         """Send message and stream response via SSE."""
+        from sabre.client.file_loader import FileLoadError, FileLoader
+
+        # Parse and load @filepath references
+        loader = FileLoader()
+        attachments = []
+        message_text = user_input  # Default to original input
+
+        try:
+            clean_text, filepaths = loader.parse_message(user_input)
+
+            # Load files if any were referenced
+            if filepaths:
+                for filepath in filepaths:
+                    self.tui.print(f'<style fg="ansiblue">Loading: {filepath}</style>')
+                    content = loader.load_file(filepath)
+                    attachments.append(content)
+                    self.tui.print(f'<style fg="ansigreen">✓ Loaded: {filepath}</style>')
+
+                # Use clean text (with @ references removed) if files were loaded
+                message_text = clean_text
+        except FileLoadError as e:
+            self.tui.print(f'<style fg="ansired">Error loading file:</style> {e}')
+            return
+
         self.processing = True
         self.cancel_requested = False
         self.current_request_id = None
@@ -177,15 +206,28 @@ class Client:
         thinking_shown = False
 
         try:
+            # Build request payload
+            import jsonpickle
+
+            payload = {
+                "type": "message",
+                "content": message_text,
+                "conversation_id": self.conversation_id,
+            }
+
+            # Add session_id if we have one
+            if self.session_id:
+                payload["session_id"] = self.session_id
+
+            # Add attachments if any were loaded
+            if attachments:
+                payload["attachments"] = jsonpickle.encode(attachments, unpicklable=True)
+
             # POST request with streaming response
             async with client.stream(
                 "POST",
                 f"{self.server_url}/v1/message",
-                json={
-                    "type": "message",
-                    "content": user_input,
-                    "conversation_id": self.conversation_id,
-                },
+                json=payload,
                 headers={"Accept": "text/event-stream"},
                 timeout=httpx.Timeout(None),  # No timeout for streaming
             ) as response:
@@ -242,6 +284,16 @@ class Client:
                     if isinstance(event, ResponseStartEvent):
                         if not response_started:
                             self.tui.print()  # Blank line before first assistant response
+
+                            # Display session info at the start if we haven't yet
+                            if not self.session_info_displayed and self.session_id:
+                                dim_color = "#666666"  # Dim gray color
+                                self.tui.print(f'<style fg="{dim_color}">Session ID: {self.session_id}</style>')
+                                if self.workspace_dir:
+                                    self.tui.print(f'<style fg="{dim_color}">Workspace: {self.workspace_dir}</style>')
+                                self.tui.print()  # Blank line after session info
+                                self.session_info_displayed = True
+
                             response_started = True
 
                         # Show "Thinking..." animation instead of tree node
@@ -263,23 +315,29 @@ class Client:
 
                     elif isinstance(event, HelpersExecutionStartEvent):
                         block_number = event.data["block_number"]
-                        logger.info(f"  └─ EXECUTING helper #{block_number}")
-                        self.tui.print_tree_node(
-                            "EXECUTING", f"helper #{block_number}...", depth=event.depth, path=event.path
+                        helper_name = event.data.get("helper_name", "unknown")
+                        label = (
+                            f"{helper_name} #{block_number}" if helper_name != "unknown" else f"helper #{block_number}"
                         )
+                        logger.info(f"  └─ EXECUTING {label}")
+                        self.tui.print_tree_node("EXECUTING", f"{label}...", depth=event.depth, path=event.path)
 
                     elif isinstance(event, HelpersExecutionEndEvent):
                         duration_ms = event.data["duration_ms"]
                         success = event.data["success"]
                         block_number = event.data["block_number"]
+                        helper_name = event.data.get("helper_name", "unknown")
                         result = event.data["result"]
 
+                        label = (
+                            f"{helper_name} #{block_number}" if helper_name != "unknown" else f"helper #{block_number}"
+                        )
                         status = "✓" if success else "✗"
-                        logger.info(f"  └─ RESULT helper #{block_number} {status} {duration_ms:.0f}ms")
+                        logger.info(f"  └─ RESULT {label} {status} {duration_ms:.0f}ms")
                         color = self.tui.colors["complete"] if success else self.tui.colors["error"]
                         self.tui.print_tree_node(
                             "RESULT",
-                            f'helper #{block_number} <style fg="{color}">{status} {duration_ms:.0f}ms</style>',
+                            f'{label} <style fg="{color}">{status} {duration_ms:.0f}ms</style>',
                             depth=event.depth,
                             path=event.path,
                         )
@@ -370,6 +428,16 @@ class Client:
 
                     elif isinstance(event, CompleteEvent):
                         final_message = event.data["final_message"]
+
+                        # Store session info (only from top-level completes)
+                        if event.depth == 1:
+                            session_id = event.data.get("session_id", "")
+                            workspace_dir = event.data.get("workspace_dir", "")
+                            if session_id:
+                                self.session_id = session_id
+                            if workspace_dir:
+                                self.workspace_dir = workspace_dir
+
                         if final_message.strip():
                             self.tui.print()  # Blank line
                             self.tui.print_tree_node("COMPLETE", "", depth=event.depth, path=event.path)
@@ -437,24 +505,50 @@ class Client:
             except asyncio.CancelledError:
                 pass
 
-    async def run_once(self, message: str):
+    async def run_once(self, message: str, export_atif: bool = False):
         """Run client in non-interactive mode with a single message"""
         try:
             async with httpx.AsyncClient() as client:
-                # Show user message
+                # Show user message (escape HTML to prevent parsing errors)
                 user_color = self.tui.colors["user_input"]
-                self.tui.print(f'<style fg="{user_color}">&gt; {message}</style>')
+                escaped_message = self.tui.html_escape(message)
+                self.tui.print(f'<style fg="{user_color}">&gt; {escaped_message}</style>')
                 self.tui.print()
 
                 # Send message
                 await self.send_message(client, message)
 
+                # Export ATIF if requested
+                if export_atif and self.conversation_id:
+                    await self._export_atif(client)
+
         except Exception as e:
-            self.tui.print(f'<style fg="ansired">Error:</style> {e}')
+            escaped_error = self.tui.html_escape(str(e))
+            self.tui.print(f'<style fg="ansired">Error:</style> {escaped_error}')
             logger.error(f"Error in run_once: {e}", exc_info=True)
             return 1
 
         return 0
+
+    async def _export_atif(self, client: httpx.AsyncClient):
+        """Request ATIF export from server"""
+        try:
+            response = await client.get(f"{self.server_url}/v1/sessions/{self.conversation_id}/atif", timeout=10.0)
+            if response.status_code == 200:
+                atif_data = response.json()
+                # ATIF is returned as JSON, we can optionally save it
+                from sabre.common.paths import get_data_dir
+
+                data_dir = get_data_dir()
+                sessions_dir = data_dir / "sessions" / self.conversation_id
+                sessions_dir.mkdir(parents=True, exist_ok=True)
+                atif_path = sessions_dir / "atif.json"
+                atif_path.write_text(json.dumps(atif_data, indent=2))
+                self.tui.print(f'\n<style fg="ansigreen">ATIF exported to: {atif_path}</style>')
+            else:
+                logger.warning(f"ATIF export failed: {response.status_code}")
+        except Exception as e:
+            logger.warning(f"Could not export ATIF: {e}")
 
     async def run(self):
         """Main client loop"""
@@ -537,16 +631,24 @@ class Client:
         return 0
 
 
-async def main():
+async def main(message: str | None = None, export_atif: bool = False):
     """Entry point for client"""
     import argparse
     from sabre.common.paths import get_logs_dir, ensure_dirs
 
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="SABRE Client")
-    parser.add_argument("message", nargs="?", help="Message to send (non-interactive mode)")
-    parser.add_argument("--port", default=os.getenv("PORT", "8011"), help="Server port")
-    args = parser.parse_args()
+    # Parse command line arguments (only if message not provided programmatically)
+    if message is None:
+        parser = argparse.ArgumentParser(description="SABRE Client")
+        parser.add_argument("message", nargs="?", help="Message to send (non-interactive mode)")
+        parser.add_argument("--port", default=os.getenv("PORT", "8011"), help="Server port")
+        parser.add_argument("--export-atif", action="store_true", help="Export ATIF trace after execution")
+        args = parser.parse_args()
+        message = args.message
+        port = args.port
+        export_atif = args.export_atif
+    else:
+        # Message provided programmatically (from CLI --message flag)
+        port = os.getenv("PORT", "8011")
 
     # Setup logging using XDG-compliant paths
     ensure_dirs()
@@ -562,14 +664,14 @@ async def main():
     )
 
     # Get server URL
-    server_url = f"http://localhost:{args.port}"
+    server_url = f"http://localhost:{port}"
 
     # Create client (use /theme to toggle light/dark mode)
     client = Client(server_url=server_url)
 
     # If message provided, run in non-interactive mode
-    if args.message:
-        return await client.run_once(args.message)
+    if message:
+        return await client.run_once(message, export_atif=export_atif)
     else:
         return await client.run()
 
